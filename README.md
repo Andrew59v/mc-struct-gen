@@ -1,6 +1,6 @@
 # MC-Struct-Gen: 3D Voxel Structure Generation with Conditional Diffusion
 
-A PyTorch-based 3D generative model for Minecraft structure generation using conditional diffusion and prototype-based classification.
+A PyTorch-based 3D generative model for Minecraft structure generation using conditional diffusion and prototype-based classification, built with the [Hugging Face Diffusers](https://github.com/huggingface/diffusers) library.
 
 > **⚠️ Work in Progress**: This is an experimental project created for learning and exploration. The implementation not be fully functional or complete.
 
@@ -19,6 +19,9 @@ MC-Struct-Gen implements a sophisticated 3D voxel generation system combining:
 mc-struct-gen/
 ├── model.py          # Core 3D UNet diffusion model with residual and attention blocks
 ├── struct_head.py    # Prototype-based classification head for voxel prediction
+├── generate.py       # Diffusers pipeline for text-to-structure generation
+├── train.py          # Training script using Diffusers for conditional diffusion
+├── main.py           # Original generation script (legacy)
 ├── requirements.txt  # Python dependencies
 └── README.md         # This file
 ```

@@ -21,7 +21,7 @@ class MCStructEmbedHead(nn.Module):
         num_blocks: int,
         meta_dim: int,
         feat_channels: Optional[int] = None,
-        embed_dim: int = 256,
+        embed_dim: int = 64,
         projector_hidden: Optional[int] = None,
         normalize_embeddings: bool = True,
         temperature: float = 1.0,
