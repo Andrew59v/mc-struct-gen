@@ -199,7 +199,6 @@ class DiffusersTrainer:
 		dataset_dir: str,
 		num_epochs: int = 5,
 		batch_size: int = 4,
-		save_steps: int = 1000,
 		max_samples: Optional[int] = None,
 		gradient_accumulation_steps: int = 1,
 	):
@@ -303,14 +302,12 @@ class DiffusersTrainer:
 
 				global_step += 1
 
-				# Save checkpoint
-				if global_step % save_steps == 0:
-					self.save_checkpoint(global_step)
-
 				# Log progress
 				if step % 100 == 0 and self.accelerator.is_main_process:
 					avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
 					logger.info(f"Step {global_step}: loss={avg_loss:.4f}, denoise={loss_dict['denoise_loss']:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
+
+			self.save_checkpoint(global_step)
 
 			# End of epoch logging
 			if self.accelerator.is_main_process:
@@ -326,9 +323,8 @@ def main():
 	parser.add_argument("--dataset_dir", type=str, default="./prepared", help="Path to dataset directory")
 	parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
 	parser.add_argument("--from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
-	parser.add_argument("--num_epochs", type=int, default=5, help="Number of training epochs")
-	parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-	parser.add_argument("--save_steps", type=int, default=1000, help="Save checkpoint every N steps")
+	parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs")
+	parser.add_argument("--batch_size", type=int, default=100, help="Batch size")
 	parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to use")
 	parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
 
@@ -348,7 +344,6 @@ def main():
 		dataset_dir=args.dataset_dir,
 		num_epochs=args.num_epochs,
 		batch_size=args.batch_size,
-		save_steps=args.save_steps,
 		max_samples=args.max_samples,
 		gradient_accumulation_steps=args.gradient_accumulation_steps,
 	)

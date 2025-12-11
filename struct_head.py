@@ -47,6 +47,7 @@ class MCStructEmbedHead(nn.Module):
         self.num_blocks = num_blocks
         self.meta_dim = meta_dim
         self.embed_dim = embed_dim
+        self.projector_hidden = projector_hidden
         self.normalize = normalize_embeddings
         self.temperature = float(temperature)
 
