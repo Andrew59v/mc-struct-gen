@@ -5,6 +5,7 @@ __pycache__/
 
 venv
 
+dataset
 output
 
 .DS_Store

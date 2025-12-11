@@ -4,3 +4,4 @@ clip @ git+https://github.com/openai/CLIP.git
 tqdm
 diffusers["torch"]
 transformers
+nbt

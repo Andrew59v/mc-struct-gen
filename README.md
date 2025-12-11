@@ -2,7 +2,7 @@
 
 A PyTorch-based 3D generative model for Minecraft structure generation using conditional diffusion and prototype-based classification, built with the [Hugging Face Diffusers](https://github.com/huggingface/diffusers) library.
 
-> **⚠️ Work in Progress**: This is an experimental project created for learning and exploration. The implementation not be fully functional or complete.
+> **⚠️ Work in Progress**: This is an experimental project created for learning and exploration. The implementation not fully functional or complete.
 
 ## Overview
 
