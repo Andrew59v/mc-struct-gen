@@ -64,4 +64,4 @@ class MCStructureDataset(Dataset):
 		}
 
 if __name__ == "__main__":
-	pass
+	pass # TODO: dataset generation script

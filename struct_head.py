@@ -101,70 +101,75 @@ class MCStructEmbedHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _compute_block_logits_from_features(self, features: torch.Tensor) -> torch.Tensor:
+    def forward_from_features(
+        self,
+        features: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        features: (B, C_feat, D, H, W)
-        returns block_logits: (B, K, D, H, W)
+        Classify voxels from precomputed features.
+
+        Args:
+            features: (B, C_feat, D, H, W)
+            meta_threshold: threshold for metadata binarization
+        
+        Returns:
+            block_ids: (B, 1, D, H, W) torch.long
+            meta_flags: (B, M, D, H, W) torch.float (0/1)
         """
         B, C, D, H, W = features.shape
 
-        # project
+        # project features to embedding space
         proj = self.projector(features)  # (B, embed_dim, D, H, W)
+        
         # optionally normalize
         if self.normalize:
-            # L2 along channel dimension
             proj_flat = proj.view(B, self.embed_dim, -1)
             proj_norm = F.normalize(proj_flat, dim=1)  # (B, embed_dim, N)
-            # embeddings normalized
             emb = F.normalize(self.block_embeddings, dim=1)  # (K, embed_dim)
         else:
             proj_norm = proj.view(B, self.embed_dim, -1)
             emb = self.block_embeddings  # (K, embed_dim)
 
-        # compute dot product: (B, N, embed_dim) @ (embed_dim, K) -> (B, N, K)
-        # proj_norm is (B, E, N) -> permute to (B, N, E)
+        # compute dot product logits: (B, E, N) @ (E, K) -> (B, N, K) -> (B, K, N)
         proj_perm = proj_norm.permute(0, 2, 1)  # (B, N, E)
         emb_t = emb.t()  # (E, K)
-
         logits = torch.matmul(proj_perm, emb_t)  # (B, N, K)
         logits = logits.permute(0, 2, 1).contiguous()  # (B, K, N)
 
-        # scale by temperature and add bias
+        # scale by temperature and add per-class bias
         logits = logits / (self.temperature + 1e-8)
-        logits = logits + self.class_bias.view(1, -1, 1)  # (1,K,1) broadcasts
+        logits = logits + self.class_bias.view(1, -1, 1)  # (1, K, 1) broadcasts
+        logits = logits.view(B, self.num_blocks, D, H, W)  # (B, K, D, H, W)
 
-        # reshape to (B,K,D,H,W)
-        logits = logits.view(B, self.num_blocks, D, H, W)
-        return logits
-
-    def forward_from_features(
+        # metadata: simple 1x1 conv over original features
+        meta_logits = self.meta_head(features)  # (B, M, D, H, W)
+        
+        return logits, meta_logits
+    
+    def logits_to_outputs(
         self,
-        features: torch.Tensor,
-        meta_threshold: float = 0.5,
-        return_logits: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        logits: torch.Tensor,
+        meta_logits: torch.Tensor,
+        meta_threshold: float = 0.5
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Classify voxels from precomputed features.
+        Convert logits to discrete outputs.
+
+        Args:
+            logits: (B, K, D, H, W)
+            meta_logits: (B, M, D, H, W)
+            meta_threshold: threshold for metadata binarization
 
         Returns:
-          block_id_int: (B,1,D,H,W) torch.long
-          meta_bits:   (B,meta_dim,D,H,W) torch.float (0/1)
-        Optionally returns block_logits and meta_logits if return_logits=True
+            block_ids: (B, 1, D, H, W) torch.long
+            meta_flags: (B, M, D, H, W) torch.float (0/1)
         """
-        # block logits
-        block_logits = self._compute_block_logits_from_features(features)  # (B,K,D,H,W)
+        block_ids = torch.argmax(logits, dim=1, keepdim=True).long()  # (B, 1, D, H, W)
 
-        # per-voxel integer id
-        block_id = torch.argmax(block_logits, dim=1, keepdim=True).long()  # (B,1,D,H,W)
-
-        # metadata logits (simple conv over original features; you could use projected features instead)
-        meta_logits = self.meta_head(features)  # (B, M, D, H, W)
         meta_probs = torch.sigmoid(meta_logits)
-        meta_bits = (meta_probs > meta_threshold).float()
+        meta_flags = (meta_probs > meta_threshold).float()  # (B, M, D, H, W)
 
-        if return_logits:
-            return block_id, meta_bits, block_logits, meta_logits
-        return block_id, meta_bits, None, None
+        return block_ids, meta_flags
 
     def forward(
         self,
@@ -172,12 +177,8 @@ class MCStructEmbedHead(nn.Module):
         timesteps: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         meta_threshold: float = 0.5,
-        return_logits: bool = False,
+        return_logits: bool = False
     ):
-        """
-        Convenience: run UNet (if attached) and classify.
-        Requires UNet to support return_features=True -> returns (unet_out, features)
-        """
         if self.model is None:
             raise RuntimeError("No UNet model attached. Use forward_from_features(...) instead or instantiate with model.")
 
@@ -186,8 +187,12 @@ class MCStructEmbedHead(nn.Module):
             _, features = out
         else:
             raise RuntimeError("UNet.forward did not return (out, features). Pass return_features=True.")
-        return self.forward_from_features(features, meta_threshold=meta_threshold, return_logits=return_logits)
-
+        
+        logits, meta_logits = self.forward_from_features(features)
+        if return_logits:
+            return logits, meta_logits
+        else:
+            return self.logits_to_outputs(logits, meta_logits, meta_threshold)
 
 # ---------------------- Smoke test ----------------------
 if __name__ == "__main__":
@@ -201,14 +206,9 @@ if __name__ == "__main__":
     unet = UNet3DConditional()
     head = MCStructEmbedHead(unet, num_blocks=12, meta_dim=4, feat_channels=None, embed_dim=128, projector_hidden=256)
 
-    # run unet once to get features (unet must return features)
-    _, features = unet(x, timesteps, text_emb, return_features=True)
-    block_id, meta_bits, block_logits, meta_logits = head.forward_from_features(features, return_logits=True)
+    block_id, meta_bits = head(x, timesteps, text_emb)
 
-    print("features:", features.shape)
     print("block_id:", block_id.shape, block_id.min().item(), block_id.max().item())
     print("meta_bits:", meta_bits.shape)
-    print("block_logits:", block_logits.shape)
-    print("meta_logits:", meta_logits.shape)
     print(block_id)
     

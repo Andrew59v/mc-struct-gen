@@ -140,29 +140,51 @@ class DiffusersTrainer:
 		logger.info(f"Saved checkpoint to {checkpoint_path}")
 
 	def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-		"""Single training step using diffusers-style diffusion training."""
-		voxels = batch['voxels']  # (B, C, D, H, W)
-		text_embeddings = batch['text_embedding']  # (B, 512)
+		"""Single training step: denoise + classify blocks and metadata."""
+		block_ids = batch['block_ids']  # (B, 1, D, H, W)
+		metadata_flags = batch['metadata_flags']  # (B, M, D, H, W)
+		text_embeddings = batch['text_embedding']  # (B, 77, 512)
 
-		# Sample random timesteps
+		B = block_ids.shape[0]
+		device = block_ids.device
+
+		# Generate random noise as initial unstructured voxels
+		noise = torch.randn(B, 32, *block_ids.shape[2:], device=device)
+		
+		# Sample random timesteps for diffusion
 		timesteps = torch.randint(
 			0, self.noise_scheduler.config.num_train_timesteps,
-			(voxels.shape[0],), device=voxels.device
+			(B,), device=device
 		)
+		
+		# Add noise at timestep t (simulates diffusion forward process)
+		noisy_input = self.noise_scheduler.add_noise(noise, noise, timesteps)
+		
+		# UNet predicts noise and extracts features
+		unet_out = self.unet(noisy_input, timesteps, text_embeddings, return_features=True)
+		
+		if isinstance(unet_out, (tuple, list)):
+			noise_pred, features = unet_out
+		else:
+			raise RuntimeError("UNet.forward did not return (out, features)")
 
-		# Add noise to voxels
-		noise = torch.randn_like(voxels)
-		noisy_voxels = self.noise_scheduler.add_noise(voxels, noise, timesteps)
+		# Get logits from struct_head
+		block_logits, meta_logits = self.struct_head.forward_from_features(features)
 
-		# Predict noise with UNet
-		noise_pred = self.unet(
-			noisy_voxels,
-			timesteps,
-			text_embeddings
-		)
+		# Loss 1: Denoising loss (predict the noise that was added)
+		denoise_loss = F.mse_loss(noise_pred, noise)
 
-		# Compute diffusion loss (simple MSE between predicted and actual noise)
-		loss = F.mse_loss(noise_pred, noise)
+		# Loss 2: Block classification loss
+		K, D, H, W = block_logits.shape[1:]
+		logits_flat = block_logits.permute(0, 2, 3, 4, 1).reshape(-1, K)
+		block_ids_flat = block_ids.squeeze(1).reshape(-1).long()
+		block_loss = F.cross_entropy(logits_flat, block_ids_flat)
+
+		# Loss 3: Metadata binary loss
+		meta_loss = F.binary_cross_entropy_with_logits(meta_logits, metadata_flags)
+
+		# Combine losses with weights
+		loss = 0.5 * denoise_loss + 0.3 * block_loss + 0.2 * meta_loss
 
 		# Backpropagate
 		self.accelerator.backward(loss)
@@ -181,7 +203,12 @@ class DiffusersTrainer:
 		if self.accelerator.sync_gradients:
 			self.ema_unet.step(self.unet.parameters())
 
-		return {"loss": loss.item()}
+		return {
+			"loss": loss.item(),
+			"denoise_loss": denoise_loss.item(),
+			"block_loss": block_loss.item(),
+			"meta_loss": meta_loss.item(),
+		}
 
 	def train(
 		self,
@@ -245,7 +272,7 @@ class DiffusersTrainer:
 				# Log progress
 				if step % 100 == 0 and self.accelerator.is_main_process:
 					avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
-					logger.info(f"Step {global_step}: loss = {avg_loss:.4f}")
+					logger.info(f"Step {global_step}: loss={avg_loss:.4f}, denoise={loss_dict['denoise_loss']:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
 
 			# End of epoch logging
 			if self.accelerator.is_main_process:

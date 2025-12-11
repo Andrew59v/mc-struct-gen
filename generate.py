@@ -251,36 +251,6 @@ def generate_structure_diffusers(
 
 	return output["block_id"], output["meta_bits"], output["block_logits"], output["meta_logits"]
 
-# Backwards compatibility function
-def generate_structure(clip_model, unet, scheduler, shape, prompt, steps=10):
-	"""
-	Backwards-compatible wrapper that creates a diffusers pipeline internally.
-	This allows existing code to work without changes.
-	"""
-	# Create pipeline from existing models
-	struct_head = MCStructEmbedHead(
-		unet, num_blocks=12, meta_dim=4,
-		embed_dim=shape[1]*2, projector_hidden=128
-	)
-
-	# Convert custom scheduler to diffusers scheduler
-	diffusers_scheduler = DDPMScheduler(
-		num_train_timesteps=scheduler.num_timesteps,
-		beta_start=scheduler.betas[0].item(),
-		beta_end=scheduler.betas[-1].item(),
-		prediction_type="epsilon",
-	)
-
-	pipeline = MCStructurePipeline(
-		unet=unet,
-		struct_head=struct_head,
-		scheduler=diffusers_scheduler,
-		clip_model=clip_model,
-	)
-
-	# Generate using diffusers
-	return generate_structure_diffusers(pipeline, prompt, shape, steps)
-
 def main():
 	"""Demo generation using diffusers pipeline."""
 	parser = argparse.ArgumentParser(description="Generate 3D Minecraft Structures with Diffusers")
