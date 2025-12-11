@@ -76,3 +76,33 @@ source venv/bin/activate  # macOS/Linux
 ```bash
 pip3 install -r requirements.txt
 ```
+
+## Usage
+
+1. Download dataset (.litematic / .schematic files) into './dataset'
+2. Make dataset manifest
+```python
+manifest: List[Dict[str, str]] = [
+  {
+    "file": "path_to.litematic",
+    "name": "title or description"
+  },{
+    "file": "path_to.schematic",
+    "name": "title or description"
+  }
+]
+with open('./dataset/dataset.json', 'w', encoding="utf-8") as fout:
+  json.dump(manifest, fout, ensure_ascii=False)
+```
+3. Prepare dataset:
+```bash
+python3 dataset.py
+```
+4. Train model:
+```bash
+python3 train.py
+```
+5. Generate structure:
+```bash
+python3 generate.py
+```

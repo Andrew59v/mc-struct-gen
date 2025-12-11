@@ -31,6 +31,15 @@ class StructureParser:
 		self.block_dict = block_dict
 		self.metadata_dict = metadata_dict
 		self.metadata_dim = metadata_dim
+	
+	def metadata_to_array(self, metadata: List[Tuple[str, str]]):
+		result = np.zeros(metadata_dim, dtype=np.bool)
+		if metadata:
+			for key, value in metadata:
+				if key in metadata_dict and value in metadata_dict[key]:
+					bit_index = self.metadata_dict[key][value]
+					result[bit_index] = 1
+		return result
 
 	def __call__(self, file_path: str) -> Tuple[str, torch.Tensor, torch.Tensor]:
 		"""Parse structure file and extract block IDs and metadata flags.
@@ -40,8 +49,8 @@ class StructureParser:
 		Returns:
 			(description, block_ids, metadata_flags): 
 				description: text description of the structure
-				block_ids: tensor of shape (D, H, W) with block IDs
-				metadata_flags: tensor of shape (M, D, H, W) with metadata binary flags
+				block_ids: tensor of shape (H, W, D) with block IDs
+				metadata_flags: tensor of shape (M, H, W, D) with metadata binary flags
 		"""
 		raise NotImplementedError
 
@@ -81,18 +90,15 @@ class SchematicParser(StructureParser):
 			if block_name not in self.block_dict:
 				continue
 			
-			metadata = re.search(r'\[(.*)\]', block_state)
-			metadata_tensor = np.zeros(metadata_dim, dtype=np.bool)
-			if metadata:
-				metadata_args = metadata.group(1).split(',')
-				for meta_arg in metadata_args:
-					key_value = meta_arg.split('=')
-					key, value = key_value[0], key_value[1]
-					if key in metadata_dict and value in metadata_dict[key]:
-						bit_index = metadata_dict[key][value]
-						metadata_tensor[bit_index] = 1
+			m = re.search(r'\[(.*)\]', block_state)
+			metadata: List[Tuple[str, str]] = []
+			if m:
+				args = m.group(1).split(',')
+				for pair in args:
+					key, value = pair.split("=")
+					metadata.append((key, value.lower()))
 			
-			map_item = (self.block_dict[block_name], metadata_tensor)
+			map_item = (self.block_dict[block_name], self.metadata_to_array(metadata))
 			if self.legacy_map[mc_block_id] is None: # usually first item is subid=0
 				self.legacy_map[mc_block_id] = [map_item] * 16
 			else:
@@ -147,9 +153,12 @@ class SchematicParser(StructureParser):
 			block_id_array[idx] = block_id
 			metadata_tensor[:, idx] = metadata_flags
 		
-		# Reshape to (D, H, W) = (length, height, width)
-		block_ids_reshaped = block_id_array.reshape((length, height, width))
-		metadata_reshaped = metadata_tensor.reshape((self.metadata_dim, length, height, width))
+		# Reshape to (H, L, W) = (height, width, length)
+		shape = (height, width, length)
+		block_ids_reshaped = block_id_array.reshape(shape)
+		metadata_reshaped = metadata_tensor.reshape((self.metadata_dim, *shape))
+		
+		# TODO: swap Z and Y here
 		
 		# Convert to tensors
 		block_ids = torch.from_numpy(block_ids_reshaped)
@@ -186,6 +195,7 @@ class LitematicParser(StructureParser):
 	# see StructureParser.__call__
 	def __call__(self, file_path: str) -> Tuple[str, torch.Tensor, torch.Tensor]:
 		nbt_data = nbt.NBTFile(file_path, 'rb')
+
 		
 		# Validate litematic format
 		if 'Version' not in nbt_data or 'Regions' not in nbt_data:
@@ -194,7 +204,7 @@ class LitematicParser(StructureParser):
 		regions = nbt_data['Regions']
 		if not regions or len(regions) == 0:
 			raise ValueError("No regions found in litematic file")
-		
+
 		# Get first region (main structure) - regions is a dict-like compound
 		region_name = list(regions.keys())[0] if hasattr(regions, 'keys') else None
 		if region_name is None:
@@ -208,50 +218,56 @@ class LitematicParser(StructureParser):
 		
 		size_tag = region_tag['Size']
 		# Size is stored as BlockPos compound with x, y, z tags
-		width = abs(size_tag['x'].value)
+		width = abs(size_tag['z'].value)
 		height = abs(size_tag['y'].value)
-		length = abs(size_tag['z'].value)
+		depth = abs(size_tag['x'].value)
+		volume = width * height * depth
 		
-		if width > 256 or height > 256 or length > 256:
-			raise ValueError(f"Structure dimensions are too large: ({length}, {height}, {width})")
-		
-		volume = width * height * length
-		
+		if width > 256 or height > 256 or depth > 256:
+			raise ValueError(f"Structure dimensions are too large: ({height}, {width}, {depth})")
+
 		# Extract block states and palette
 		if 'BlockStates' not in region_tag or 'BlockStatePalette' not in region_tag:
 			raise ValueError(f"Region '{region_name}' missing BlockStates or BlockStatePalette")
 		
 		block_states_raw = region_tag['BlockStates'].value
 		block_states = np.array(block_states_raw, dtype=np.int64)
-		
+
+		palette: List[Tuple[int, np.ndarray]] = []
 		palette_tag = region_tag['BlockStatePalette']
+		for palette_item in palette_tag:
+			name = palette_item["Name"].value
+			if name not in self.block_dict:
+				raise RuntimeError("Palette contains unknown block:" + name)
+			metadata = []
+			if "Properties" in palette_item:
+				properties = palette_item["Properties"]
+				for key, value in properties.items():
+					metadata.append((key, str(value).lower()))
+			palette.append((self.block_dict[name], self.metadata_to_array(metadata)))
 		
 		# Decode block states to palette indices
-		blocks = LitematicParser._decode_block_states(block_states, palette_tag, length, height, width, volume)
-		
-		# Reshape to (length, height, width) = (D, H, W)
-		blocks = blocks.reshape((length, height, width))
-		
-		# Convert to tensor
-		block_ids = torch.from_numpy(blocks).long()  # (D, H, W)
-		
-		# Calculate num metadata channels from metadata_dict
-		num_metadata_channels = 0
-		if metadata_dict:
-			for attr_map in metadata_dict.values():
-				if attr_map:
-					num_metadata_channels = max(num_metadata_channels, max(attr_map.values()) + 1)
-		
-		D, H, W = blocks.shape
-		metadata_flags = torch.zeros(num_metadata_channels, D, H, W, dtype=torch.bool)
-		
-		# TODO: Extract block state properties from palette for metadata
-		# This requires parsing BlockStatePalette tags for each block's properties
+		blocks = LitematicParser._decode_block_states(block_states, len(palette_tag), volume)
+
+		shape = (height, width, depth)
+		block_ids = torch.zeros(shape, dtype=torch.uint16)
+		metadata_flags = torch.zeros((self.metadata_dim, *shape), dtype=torch.bool)
+
+		# Extract real block_ids and metadata_flags from palette indices
+		blocks_reshaped = blocks.reshape(shape)
+		for h in range(height):
+			for w in range(width):
+				for l in range(depth):
+					palette_idx = blocks_reshaped[h, w, l]
+					if palette_idx < len(palette):
+						block_id, metadata = palette[palette_idx]
+						block_ids[h, w, l] = block_id
+						metadata_flags[:, h, w, l] = torch.from_numpy(metadata)
 		
 		return None, block_ids, metadata_flags
 	
 	@staticmethod
-	def _decode_block_states(block_states: np.ndarray, palette_tag, length: int, height: int, width: int, volume: int) -> np.ndarray:
+	def _decode_block_states(block_states: np.ndarray, palette_size: int, volume: int) -> np.ndarray:
 		"""Decode block states from long array (packed palette indices).
 		
 		Litematica stores blocks as palette indices in a packed bit array stored in longs (int64).
@@ -263,7 +279,6 @@ class LitematicParser(StructureParser):
 		blocks = np.zeros(volume, dtype=np.uint16)
 		
 		# Calculate bits per block based on palette size
-		palette_size = len(palette_tag) if hasattr(palette_tag, '__len__') else 16
 		if palette_size <= 1:
 			bits_per_block = 1
 		else:
@@ -322,7 +337,7 @@ class MCStructureDataset(Dataset):
 		sample = torch.load(sample_path)
 		
 		return {
-			'block_ids': sample['block_ids'],
+			'block_ids': sample['block_ids'].unsqueeze(0),  # (H, W, D) -> (1, H, W, D)
 			'metadata_flags': sample['metadata_flags'],
 			'text_embedding': sample['text_embedding'],
 		}
@@ -335,6 +350,7 @@ class DatasetGenerator:
 		self,
 		block_dict: Dict[str, int],
 		metadata_dict: Dict[str, Dict[str, int]],
+		metadata_dim: int,
 		clip_model,
 		dataset_dir: str = "./dataset",
 		output_dir: str = "./prepared",
@@ -351,10 +367,6 @@ class DatasetGenerator:
 			output_dir: Path to ./prepared folder to save processed samples
 			legacy_file: Path to legacy block ID mapping file
 		"""
-		largest_bit = 0
-		for attr_map in metadata_dict.values():
-			largest_bit = max(largest_bit, max(attr_map.values()))
-		metadata_dim = largest_bit + 1
 
 		self.dataset_dir = Path(dataset_dir)
 		self.clip_model = clip_model
@@ -367,7 +379,7 @@ class DatasetGenerator:
 		if not self.manifest_path.exists():
 			raise FileNotFoundError(f"dataset.json not found in {self.dataset_dir}")
 		
-		with open(self.manifest_path, 'r') as f:
+		with open(self.manifest_path, 'r', encoding='utf-8') as f:
 			self.manifest = json.load(f)
 		
 		if not isinstance(self.manifest, list):
@@ -398,6 +410,36 @@ class DatasetGenerator:
 		else:
 			raise ValueError(f"Unsupported file format: {file_path}")
 	
+	def print_slices(self, block_ids, metadata_flags):
+		"""
+		Prints vertical slices of the structure to console.
+		Just for debug purposes
+		"""
+		import numpy as np
+
+		# Convert to numpy if tensor
+		if hasattr(block_ids, 'cpu'):
+			block_ids = block_ids.cpu().numpy()
+
+		# Get dimensions
+		height, width, depth = block_ids.shape
+		print(f"\nStructure dimensions: {height}x{width}x{depth}")
+		print("=" * 50)
+
+		# Print horizontal slices (top to bottom)
+		for y in range(height):
+			print(f"\nLayer Y={y} (height {y}/{height-1}):")
+			print("-" * 30)
+
+			for x in range(width):
+				row = ""
+				for z in range(depth):
+					block_id = int(block_ids[y, x, z])
+					row += f"{block_id:4d}"
+				print(f"X={x:2d}: {row}")
+
+			print()
+
 	def process(self, sample_idx: Optional[int] = None):
 		"""
 		Process single structure or all structures.
@@ -407,6 +449,9 @@ class DatasetGenerator:
 		"""
 		samples = [self.manifest[sample_idx]] if sample_idx is not None else self.manifest
 		
+		success = 0
+		failed = 0
+
 		for i, structure_info in enumerate(samples):
 			try:
 				file_path = structure_info['file']
@@ -416,6 +461,8 @@ class DatasetGenerator:
 				description, block_ids, metadata_flags = self._parse_structure(file_path)
 				if description is None:
 					description = structure_info.get('description', structure_info['title'])
+
+				#self.print_slices(block_ids, metadata_flags)
 				
 				# Get text embedding using generate.py's function
 				text_embedding = get_text_embedding(
@@ -433,12 +480,15 @@ class DatasetGenerator:
 				}, output_path)
 				
 				logger.info(f"Saved prepared sample to {output_path}")
-				logger.info(f"  block_ids: {block_ids.shape}, metadata_flags: {metadata_flags.shape}, text_emb: {text_embedding.shape}")
-				
+				#logger.info(f"  block_ids: {block_ids.shape}, metadata_flags: {metadata_flags.shape}, text_emb: {text_embedding.shape}")
+				success += 1
 			except Exception as e:
-				raise e
-				#logger.error(f"Failed to process {structure_info.get('file', 'unknown')}: {e}")
-				#continue
+				logger.error(f"Failed to process {structure_info.get('file', 'unknown')}: {e}")
+				failed += 1
+				
+		logger.info(f"Processed {len(samples)} samples")
+		logger.info(f"Successful: {success}")
+		logger.info(f"Failed: {failed}")
 
 
 if __name__ == "__main__":
@@ -446,13 +496,18 @@ if __name__ == "__main__":
 	logging.basicConfig(level=logging.INFO)
 
 	# {"<block_id>": <index>, ...}
-	with open("./blocks.json", 'r') as f:
-		block_dict = json.load(f)
-	
 	# {"<metadata_key>": {"metadata_value": <index>, ...}, ...}
-	with open("./metadata.json", 'r') as f:
-		metadata_dict = json.load(f)
+	with open("./dictionary.json", 'r', encoding='utf-8') as f:
+		dictionary = json.load(f)
+		metadata_dict = dictionary["metadata"]
+		block_dict = dictionary["blocks"]
 
+	metadata_dim = 32
+	for attr_map in metadata_dict.values():
+		metadata_dim = max(metadata_dim, max(attr_map.values()) + 1)
+	
+	assert metadata_dim == 32, "Metadata dictionary contains indicies > 31"
+	
 	clip_model, _ = clip.load("ViT-B/32", device="cpu")
 
 	# Initialize generator
@@ -460,6 +515,7 @@ if __name__ == "__main__":
 		block_dict=block_dict,
 		metadata_dict=metadata_dict,
 		clip_model=clip_model,
+		metadata_dim=metadata_dim
 	)
 	
 	# Process all structures

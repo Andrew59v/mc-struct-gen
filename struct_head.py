@@ -18,11 +18,11 @@ class MCStructEmbedHead(nn.Module):
     def __init__(
         self,
         model: Optional[UNet3DConditional],
-        num_blocks: int,
-        meta_dim: int,
+        num_blocks: int = 512,
+        meta_dim: int = 32,
         feat_channels: Optional[int] = None,
         embed_dim: int = 64,
-        projector_hidden: Optional[int] = None,
+        projector_hidden: Optional[int] = 128,
         normalize_embeddings: bool = True,
         temperature: float = 1.0,
         freeze_embeddings: bool = False,
@@ -110,11 +110,10 @@ class MCStructEmbedHead(nn.Module):
 
         Args:
             features: (B, C_feat, D, H, W)
-            meta_threshold: threshold for metadata binarization
-        
+
         Returns:
-            block_ids: (B, 1, D, H, W) torch.long
-            meta_flags: (B, M, D, H, W) torch.float (0/1)
+            block_logits: (B, K, D, H, W) torch.float - classification logits for each block type
+            meta_logits: (B, M, D, H, W) torch.float - metadata prediction logits
         """
         B, C, D, H, W = features.shape
 

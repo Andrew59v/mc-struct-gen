@@ -84,7 +84,7 @@ class MCStructurePipeline(DiffusionPipeline):
 
 		# Set dimensions
 		batch_size = num_images_per_prompt
-		shape = (batch_size, self.unet.in_channels, depth, height, width)
+		shape = (batch_size, self.unet.in_channels, height, width, depth)
 
 		# Get text embeddings using CLIP (token-level)
 		text_emb = get_text_embedding(self.clip_model, [prompt], self.device)
@@ -229,21 +229,21 @@ def generate_structure_diffusers(
 	Args:
 		pipeline: MCStructurePipeline instance
 		prompt: Text description
-		shape: (batch_size, channels, depth, height, width)
+		shape: (batch_size, channels, height, width, depth)
 		steps: Number of inference steps
 		guidance_scale: Classifier-free guidance scale
 
 	Returns:
 		Same format as original: (block_id, meta_bits, block_logits, meta_logits)
 	"""
-	batch_size, channels, depth, height, width = shape
+	batch_size, channels, height, width, depth = shape
 
 	# Generate using diffusers pipeline
 	output = pipeline(
 		prompt=prompt,
-		depth=depth,
 		height=height,
 		width=width,
+		depth=depth,
 		num_inference_steps=steps,
 		guidance_scale=guidance_scale,
 		num_images_per_prompt=batch_size,
@@ -258,9 +258,9 @@ def main():
 	parser.add_argument("--prompt", type=str, default="A simple house", help="Text description of structure")
 	parser.add_argument("--steps", type=int, default=50, help="Number of inference steps")
 	parser.add_argument("--guidance_scale", type=float, default=5.0, help="Classifier-free guidance scale")
-	parser.add_argument("--depth", type=int, default=8, help="Structure depth")
 	parser.add_argument("--height", type=int, default=8, help="Structure height")
 	parser.add_argument("--width", type=int, default=8, help="Structure width")
+	parser.add_argument("--depth", type=int, default=8, help="Structure depth")
 
 	args = parser.parse_args()
 
@@ -270,9 +270,9 @@ def main():
 	print(f"Generating structure: '{args.prompt}'")
 	output = pipeline(
 		prompt=args.prompt,
-		depth=args.depth,
 		height=args.height,
 		width=args.width,
+		depth=args.depth,
 		num_inference_steps=args.steps,
 		guidance_scale=args.guidance_scale,
 	)
