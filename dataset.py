@@ -152,8 +152,8 @@ class SchematicParser(StructureParser):
 		metadata_reshaped = metadata_tensor.reshape((self.metadata_dim, length, height, width))
 		
 		# Convert to tensors
-		block_ids = torch.from_numpy(block_ids_reshaped).long()
-		metadata_flags = torch.from_numpy(metadata_reshaped).float()
+		block_ids = torch.from_numpy(block_ids_reshaped)
+		metadata_flags = torch.from_numpy(metadata_reshaped)
 		
 		return None, block_ids, metadata_flags
 
@@ -243,7 +243,7 @@ class LitematicParser(StructureParser):
 					num_metadata_channels = max(num_metadata_channels, max(attr_map.values()) + 1)
 		
 		D, H, W = blocks.shape
-		metadata_flags = torch.zeros(num_metadata_channels, D, H, W, dtype=torch.float32)
+		metadata_flags = torch.zeros(num_metadata_channels, D, H, W, dtype=torch.bool)
 		
 		# TODO: Extract block state properties from palette for metadata
 		# This requires parsing BlockStatePalette tags for each block's properties
@@ -260,7 +260,7 @@ class LitematicParser(StructureParser):
 		
 		The bits are stored LSB-first within each long, and the longs are read in order.
 		"""
-		blocks = np.zeros(volume, dtype=np.uint32)
+		blocks = np.zeros(volume, dtype=np.uint16)
 		
 		# Calculate bits per block based on palette size
 		palette_size = len(palette_tag) if hasattr(palette_tag, '__len__') else 16
