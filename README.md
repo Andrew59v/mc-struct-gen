@@ -23,9 +23,14 @@ mc-struct-gen/
 ├── generate.py       # Diffusers pipeline for text-to-structure generation
 ├── dataset.py        # Data loading utilities for voxel structures and text embeddings
 ├── train.py          # Training script using Diffusers for conditional diffusion
+├── legacy.json       # Legacy minecraft block/item ids for .schematic parser
+├── blocks.json       # Block dictionary for model
+├── metadata.json     # Metadata dictionary for model
 ├── requirements.txt  # Python dependencies
 └── README.md         # This file
 ```
+
+legacy.json file is sourced from [minecraft-data](https://github.com/PrismarineJS/minecraft-data).
 
 ## Key Components
 
