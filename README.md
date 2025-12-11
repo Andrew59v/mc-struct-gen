@@ -24,8 +24,7 @@ mc-struct-gen/
 ├── dataset.py        # Data loading utilities for voxel structures and text embeddings
 ├── train.py          # Training script using Diffusers for conditional diffusion
 ├── legacy.json       # Legacy minecraft block/item ids for .schematic parser
-├── blocks.json       # Block dictionary for model
-├── metadata.json     # Metadata dictionary for model
+├── dictionary.json   # Metadata/Block dictionary for model
 ├── requirements.txt  # Python dependencies
 └── README.md         # This file
 ```
@@ -106,3 +105,9 @@ python3 train.py
 ```bash
 python3 generate.py
 ```
+
+## TODO
+
+1. Test everything
+2. Group samples with similar size to more efficient training
+3. Generate some structures

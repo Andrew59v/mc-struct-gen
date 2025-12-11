@@ -7,7 +7,7 @@ venv
 
 dataset
 prepared
-output
+checkpoints
 
 .DS_Store
 

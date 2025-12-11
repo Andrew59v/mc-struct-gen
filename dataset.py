@@ -117,7 +117,9 @@ class SchematicParser(StructureParser):
 		length = nbt_data['Length'].value
 		volume = width * height * length
 		
-		if width > 256 or height > 256 or length > 256:
+		if width <= 0 or height <= 0 or length <= 0:
+			raise ValueError(f"Structure dimensions are invalid: ({width}, {height}, {length})")
+		if width > 64 or height > 64 or length > 64:
 			raise ValueError(f"Structure dimensions are too large: ({width}, {height}, {length})")
 		if 'AddBlocks' in nbt_data:
 			raise NotImplementedError("AddBlocks format not supported yet")
@@ -223,7 +225,9 @@ class LitematicParser(StructureParser):
 		depth = abs(size_tag['x'].value)
 		volume = width * height * depth
 		
-		if width > 256 or height > 256 or depth > 256:
+		if width <= 0 or height <= 0 or depth <= 0:
+			raise ValueError(f"Structure dimensions are invalid: ({width}, {height}, {depth})")
+		if width > 64 or height > 64 or depth > 64:
 			raise ValueError(f"Structure dimensions are too large: ({height}, {width}, {depth})")
 
 		# Extract block states and palette

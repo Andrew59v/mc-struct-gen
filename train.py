@@ -208,65 +208,75 @@ class DiffusersTrainer:
 		dataset = MCStructureDataset(dataset_dir, max_samples)
 
 		def collate_fn(batch):
-			"""Custom collate function to handle variable-sized 3D structures by cropping/padding to fixed size."""
-			# Target size for the model (8x8x8)
-			target_H, target_W, target_D = 8, 8, 8
+			"""Custom collate function to pad structures to batch max size (ceiled to multiple of 8)."""
+			# Find maximum dimensions in the batch
+			max_H = max(sample['block_ids'].shape[1] for sample in batch)
+			max_W = max(sample['block_ids'].shape[2] for sample in batch)
+			max_D = max(sample['block_ids'].shape[3] for sample in batch)
 
+			# Ceil to nearest multiple of 8
+			target_H = ((max_H + 7) // 8) * 8
+			target_W = ((max_W + 7) // 8) * 8
+			target_D = ((max_D + 7) // 8) * 8
+
+			# First pass: identify valid samples (those with valid 3D dimensions)
+			valid_samples = []
+			for sample in batch:
+				block_ids = sample['block_ids']
+				B, H, W, D = block_ids.shape
+
+				# Skip samples with invalid dimensions
+				if H <= 0 or W <= 0 or D <= 0:
+					tqdm.write(f"Skipping sample with invalid dimensions: {(B, H, W, D)}")
+					continue
+
+				valid_samples.append(sample)
+
+			# If no valid samples, skip this batch
+			if not valid_samples:
+				return None
+
+			# Second pass: process valid samples only
 			collated = {}
 			for key in batch[0].keys():
 				if key in ['block_ids', 'metadata_flags']:
 					processed_tensors = []
-					for sample in batch:
+					for sample in valid_samples:
 						tensor = sample[key]  # Shape: (1, H, W, D) for block_ids, (M, H, W, D) for metadata_flags
+						B, H, W, D = tensor.shape
 
-						# Resize spatial dimensions to exactly (target_H, target_W, target_D)
-						# Crop center if too large, pad with zeros if too small
-						result = tensor
+						# Calculate padding needed
+						pad_h = target_H - H  # Pad only upward (keep grounded)
+						pad_w = target_W - W  # Pad equally left/right
+						pad_d = target_D - D  # Pad equally front/back
 
-						# Handle H dimension (dim 1)
-						if result.shape[1] > target_H:
-							start_h = (result.shape[1] - target_H) // 2
-							result = result[:, start_h:start_h + target_H, :, :]
-						elif result.shape[1] < target_H:
-							pad_h = target_H - result.shape[1]
-							pad_top = pad_h // 2
-							pad_bottom = pad_h - pad_top
-							result = torch.nn.functional.pad(result, (0, 0, 0, 0, pad_top, pad_bottom))
+						# For Y (height): pad only on top (pad_H_before = 0, pad_H_after = pad_h)
+						pad_H_before = 0
+						pad_H_after = pad_h
 
-						# Handle W dimension (dim 2)
-						if result.shape[2] > target_W:
-							start_w = (result.shape[2] - target_W) // 2
-							result = result[:, :, start_w:start_w + target_W, :]
-						elif result.shape[2] < target_W:
-							pad_w = target_W - result.shape[2]
-							pad_left = pad_w // 2
-							pad_right = pad_w - pad_left
-							result = torch.nn.functional.pad(result, (0, 0, pad_left, pad_right, 0, 0))
+						# For X (width) and Z (depth): pad equally on both sides
+						pad_W_before = pad_w // 2
+						pad_W_after = pad_w - pad_W_before
+						pad_D_before = pad_d // 2
+						pad_D_after = pad_d - pad_D_before
 
-						# Handle D dimension (dim 3)
-						if result.shape[3] > target_D:
-							start_d = (result.shape[3] - target_D) // 2
-							result = result[:, :, :, start_d:start_d + target_D]
-						elif result.shape[3] < target_D:
-							pad_d = target_D - result.shape[3]
-							pad_front = pad_d // 2
-							pad_back = pad_d - pad_front
-							result = torch.nn.functional.pad(result, (pad_front, pad_back, 0, 0, 0, 0))
+						# Apply padding: (pad_D_before, pad_D_after, pad_W_before, pad_W_after, pad_H_before, pad_H_after, pad_B_before, pad_B_after)
+						padding = (pad_D_before, pad_D_after, pad_W_before, pad_W_after, pad_H_before, pad_H_after, 0, 0)
+						result = torch.nn.functional.pad(tensor, padding)
 
 						processed_tensors.append(result)
 
 					collated[key] = torch.stack(processed_tensors)
 				else:
-					# Stack other tensors normally (text embeddings)
-					collated[key] = torch.stack([sample[key] for sample in batch])
-
+					# Stack other tensors normally (text embeddings) - only for valid samples
+					collated[key] = torch.stack([sample[key] for sample in valid_samples])
 			return collated
 
 		dataloader = DataLoader(
 			dataset,
 			batch_size=batch_size,
 			shuffle=True,
-			num_workers=0,  # Set to 0 for debugging, can increase later
+			num_workers=0,  # Set to 0 - nested collate_fn can't be pickled for multiprocessing
 			pin_memory=True,
 			collate_fn=collate_fn,
 		)
@@ -296,6 +306,10 @@ class DiffusersTrainer:
 			epoch_losses = []
 
 			for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+				# Skip invalid batches (collate_fn returned None)
+				if batch is None:
+					continue
+
 				# Training step
 				loss_dict = self.train_step(batch)
 				epoch_losses.append(loss_dict["loss"])
@@ -305,17 +319,17 @@ class DiffusersTrainer:
 				# Log progress
 				if step % 100 == 0 and self.accelerator.is_main_process:
 					avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
-					logger.info(f"Step {global_step}: loss={avg_loss:.4f}, denoise={loss_dict['denoise_loss']:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
+					tqdm.write(f"Step {global_step}: loss={avg_loss:.4f}, denoise={loss_dict['denoise_loss']:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
 
 			self.save_checkpoint(global_step)
 
 			# End of epoch logging
 			if self.accelerator.is_main_process:
 				avg_epoch_loss = np.mean(epoch_losses)
-				logger.info(f"Epoch {epoch+1}/{num_epochs} completed. Average loss: {avg_epoch_loss:.4f}")
+				tqdm.write(f"Epoch {epoch+1}/{num_epochs} completed. Average loss: {avg_epoch_loss:.4f}")
 
 		# Save final model
-		self.save_checkpoint(global_step)
+		# self.save_checkpoint(global_step)
 		logger.info("Training completed!")
 
 def main():
@@ -324,7 +338,7 @@ def main():
 	parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
 	parser.add_argument("--from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
 	parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs")
-	parser.add_argument("--batch_size", type=int, default=100, help="Batch size")
+	parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
 	parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to use")
 	parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
 
