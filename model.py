@@ -5,22 +5,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ----------------------------- Utilities ---------------------------------
-class SinusoidalPosEmb(nn.Module):
-	def __init__(self, dim: int):
-		super().__init__()
-		self.dim = dim
+from diffusers.models.embeddings import Timesteps
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		device = x.device
-		half_dim = self.dim // 2
-		emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
-		emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-		emb = x[:, None].float() * emb[None, :]
-		emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-		if self.dim % 2 == 1:
-			emb = F.pad(emb, (0, 1))
-		return emb
+import clip
+
+# ----------------------------- CLIP Text Embedding Helper -----------------
+def get_text_embedding(clip_model, prompts: list, device = "cpu") -> torch.Tensor:
+		with torch.no_grad():
+				text_tokens = clip.tokenize(prompts, truncate=True)
+				text_tokens = text_tokens.to(device)
+				
+				# We need to access the intermediate token embeddings
+				# CLIP's encode_text processes tokens through transformer and returns pooled output
+				# To get token-level embeddings, we need to access the transformer directly
+				
+				# Get token embeddings by passing through text encoder's transformer
+				text = clip_model.token_embedding(text_tokens)  # (B, L, 512)
+				text = text + clip_model.positional_embedding
+				text = text.permute(1, 0, 2)  # (L, B, 512)
+				text = clip_model.transformer(text)
+				text = text.permute(1, 0, 2)  # (B, L, 512)
+				text = clip_model.ln_final(text)
+				return text.float()
 
 # ----------------------------- Basic Blocks -------------------------------
 class ResidualBlock3D(nn.Module):
@@ -232,11 +238,11 @@ class UNet3DConditional(nn.Module):
 		self.init_conv = nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=1)
 
 		# time & text embedding processors
-		self.time_embed = nn.Sequential(
-			SinusoidalPosEmb(time_emb_dim // 2),
-			nn.Linear(time_emb_dim // 2, time_emb_dim),
-			nn.SiLU(),
-			nn.Linear(time_emb_dim, time_emb_dim),
+		self.time_embed = Timesteps(
+			num_channels=512,
+			flip_sin_to_cos=False,
+			downscale_freq_shift=1.0,
+			scale=1
 		)
 
 		self.text_proj = nn.Sequential(nn.Linear(text_dim, time_emb_dim), nn.SiLU())
@@ -371,7 +377,7 @@ if __name__ == "__main__":
 	D, H, W = 16, 16, 16
 	x = torch.randn(B, C, D, H, W)
 	timesteps = torch.randint(0, 1000, (B,))
-	text_emb = torch.randn(B, 512)
+	text_emb = torch.randn(B, 10, 512)
 
 	out = model(x, timesteps, text_emb)
 	print("out shape", out.shape)

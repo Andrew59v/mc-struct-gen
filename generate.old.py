@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-from model import UNet3DConditional
+from model import get_text_embedding, UNet3DConditional
 from struct_head import MCStructEmbedHead
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -30,15 +30,9 @@ class NoiseScheduler:
 		self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
 		return self
 
-def get_text_embedding(clip_model, prompts, device=DEVICE):
-	with torch.no_grad():
-		text_tokens = clip.tokenize(prompts, truncate=True).to(device)
-		text_features = clip_model.encode_text(text_tokens)
-	return text_features.float()
-
 def generate_structure(clip_model, unet, scheduler, shape, prompt, steps=10):
-	text_emb = get_text_embedding(clip_model, [prompt,])
-	notext_emb = get_text_embedding(clip_model, ["",])
+	text_emb = get_text_embedding(clip_model, [prompt,], device=DEVICE)
+	notext_emb = get_text_embedding(clip_model, ["",], device=DEVICE)
 	guidance_scale = 5.0
 
 	latents = torch.randn(shape, device=DEVICE)

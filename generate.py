@@ -15,7 +15,7 @@ import argparse
 from diffusers import DiffusionPipeline, DDPMScheduler
 from accelerate import Accelerator
 
-from model import UNet3DConditional
+from model import get_text_embedding, UNet3DConditional
 from struct_head import MCStructEmbedHead
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,12 +86,15 @@ class MCStructurePipeline(DiffusionPipeline):
         batch_size = num_images_per_prompt
         shape = (batch_size, self.unet.in_channels, depth, height, width)
 
-        # Get text embeddings using CLIP
-        text_emb = self._get_text_embedding([prompt])
+        # Get text embeddings using CLIP (token-level)
+        text_emb = get_text_embedding(self.clip_model, [prompt], self.device)
+        print("text_emb shape (tokens):", text_emb.shape)  # torch.Size([1, 77, 512])
+        
         if guidance_scale > 1.0:
             # For classifier-free guidance, we need unconditional embeddings
-            uncond_emb = self._get_text_embedding([""])
-            text_emb = torch.cat([uncond_emb, text_emb])
+            uncond_emb = get_text_embedding(self.clip_model, [""], self.device)
+            # Concatenate along batch dimension for both conditional and unconditional
+            text_emb = torch.cat([uncond_emb, text_emb], dim=0)  # (2, 77, 512)
 
         # Generate latents if not provided
         if latents is None:
@@ -147,14 +150,6 @@ class MCStructurePipeline(DiffusionPipeline):
             return output
         else:
             return (block_id, meta_bits, features, latents)
-
-    def _get_text_embedding(self, prompts: list) -> torch.Tensor:
-        """Get CLIP text embeddings for prompts."""
-        with torch.no_grad():
-            text_tokens = clip.tokenize(prompts, truncate=True)
-            text_tokens = text_tokens.to(self.device)
-            text_features = self.clip_model.encode_text(text_tokens)
-        return text_features.float()
 
 def create_diffusers_pipeline(
     model_path: Optional[str] = None,
@@ -315,11 +310,6 @@ def main():
     block_id = output["block_id"]
     print(f"Generated structure shape: {block_id.shape}")
     print(f"Block ID range: {block_id.min().item()} - {block_id.max().item()}")
-
-    # For backwards compatibility demo
-    print("\n--- Backwards Compatibility Demo ---")
-    # This would work with the original models from main.py
-    print("You can use generate_structure() just like before, but now powered by diffusers!")
 
 if __name__ == "__main__":
     main()
