@@ -167,7 +167,10 @@ class DiffusersTrainer:
 		meta_loss = F.binary_cross_entropy_with_logits(meta_logits, metadata_flags.float())
 
 		# Combine losses with weights
-		loss = 0.5 * denoise_loss + 0.3 * block_loss + 0.2 * meta_loss
+		# Scale meta_loss by 50 because metadata is often zero, making BCE loss very small (< 0.01)
+		# This ensures metadata contributes meaningfully to training despite sparsity
+		# initial (for reference): denoise=1.0962, block=5.8414, meta=0.6069
+		loss = 0.5 * denoise_loss + 0.3 * block_loss + 50 * meta_loss
 
 		# Backpropagate
 		self.accelerator.backward(loss)
