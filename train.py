@@ -110,9 +110,10 @@ class DiffusersTrainer:
 		# UNet predicts the noise (epsilon prediction)
 		noise_pred = self.unet(noisy_input, timesteps, text_embeddings)
 
-		# Loss 1: Denoising loss (predict the noise that was added)
-		denoise_loss = F.mse_loss(noise_pred, noise)
-		
+		# Skip denoising loss - rely on reconstruction losses to indirectly train denoising
+		# The block/meta losses will force the UNet to learn good denoising since
+		# bad denoising → bad reconstructions → high loss
+
 		# For classification, reconstruct denoised latent from noise prediction
 		# x_0 = (x_t - sqrt(1 - alpha_bar_t) * epsilon_pred) / sqrt(alpha_bar_t)
 		alpha_prod_t = self.noise_scheduler.alphas_cumprod[timesteps]
@@ -122,22 +123,22 @@ class DiffusersTrainer:
 		# Get logits from struct_head using denoised latent
 		block_logits, meta_logits = self.struct_head.forward_from_features(denoised_latent)
 
-		# Loss 2: Block classification loss
+		# Loss 1: Block classification loss (primary objective)
 		K, H, W, D = block_logits.shape[1:]
 		logits_flat = block_logits.permute(0, 2, 3, 4, 1).reshape(-1, K)
 		block_ids_flat = block_ids.squeeze(1).reshape(-1).long()
 		block_loss = F.cross_entropy(logits_flat, block_ids_flat)
 
-		# Loss 3: Metadata binary loss
+		# Loss 2: Metadata binary loss
 		meta_loss = F.binary_cross_entropy_with_logits(meta_logits, metadata_flags.float())
 
-		# Combine losses with weights
-		# Balanced weighting: block classification primary, denoising as regularization, metadata as auxiliary
-		loss = 0.2 * denoise_loss + 0.6 * block_loss + 0.2 * meta_loss
+		# Combine losses - focus on reconstruction objectives
+		# Block loss indirectly enforces good denoising
+		loss = 0.7 * block_loss + 0.3 * meta_loss
 
 		# Check for NaN/inf losses (debugging)
 		if torch.isnan(loss) or torch.isinf(loss):
-			print(f"NaN/inf detected: denoise={denoise_loss.item():.4f}, block={block_loss.item():.4f}, meta={meta_loss.item():.4f}")
+			print(f"NaN/inf detected: block={block_loss.item():.4f}, meta={meta_loss.item():.4f}")
 			# Replace with a reasonable fallback
 			loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
 
@@ -157,7 +158,6 @@ class DiffusersTrainer:
 
 		return {
 			"loss": loss.item(),
-			"denoise_loss": denoise_loss.item(),
 			"block_loss": block_loss.item(),
 			"meta_loss": meta_loss.item(),
 		}
@@ -321,7 +321,7 @@ class DiffusersTrainer:
 				# Log progress
 				if step % 100 == 0 and self.accelerator.is_main_process:
 					avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
-					tqdm.write(f"Step {global_step}: loss={avg_loss:.4f}, denoise={loss_dict['denoise_loss']:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
+					tqdm.write(f"Step {global_step}: loss={avg_loss:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
 
 			self.save_checkpoint(global_step)
 

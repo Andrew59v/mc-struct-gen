@@ -159,7 +159,7 @@ def create_diffusers_pipeline(
 	"""
 	# Initialize models
 	unet = UNet3DConditional()
-	struct_head = MCStructEmbedHead(unet)
+	struct_head = MCStructEmbedHead(unet, temperature=0.01)
 
 	# Load CLIP model
 	clip_model, _ = clip.load("ViT-B/32", device=device)
@@ -203,9 +203,9 @@ def main():
 	"""Demo generation using diffusers pipeline."""
 	parser = argparse.ArgumentParser(description="Generate 3D Minecraft Structures with Diffusers")
 	parser.add_argument("--model_path", type=str, default="./checkpoints/checkpoint-3149/checkpoint.pt", help="Path to trained model weights")
-	parser.add_argument("--prompt", type=str, default="Tower", help="Text description of structure")
-	parser.add_argument("--steps", type=int, default=100, help="Number of inference steps")
-	parser.add_argument("--guidance_scale", type=float, default=7.0, help="Classifier-free guidance scale")
+	parser.add_argument("--prompt", type=str, default="Solid block", help="Text description of structure")
+	parser.add_argument("--steps", type=int, default=50, help="Number of inference steps")
+	parser.add_argument("--guidance_scale", type=float, default=1.0, help="Classifier-free guidance scale")
 	parser.add_argument("--height", type=int, default=32, help="Structure height")
 	parser.add_argument("--width", type=int, default=16, help="Structure width")
 	parser.add_argument("--depth", type=int, default=16, help="Structure depth")
