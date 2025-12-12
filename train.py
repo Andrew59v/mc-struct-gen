@@ -9,6 +9,7 @@ import numpy as np
 from typing import Optional, Dict, Any, List
 import argparse
 import json
+from pathlib import Path
 
 # Diffusers imports for training infrastructure
 from diffusers import DDPMScheduler, UNet2DConditionModel
@@ -31,16 +32,45 @@ class DiffusersTrainer:
 		model_dir: str,
 		from_checkpoint: Optional[str] = None
 	):
-		self.model_dir = model_dir
+		self.model_dir = Path(model_dir)
 		self.from_checkpoint = from_checkpoint
 
-	def _load_checkpoint(self, checkpoint_path: str):
+	def _get_last_checkpoint(self):
+		checkpoint_names = [d.name for d in self.model_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")]
+		if not checkpoint_names:
+			return None
+
+		# Extract step numbers and find the latest
+		steps = []
+		for name in checkpoint_names:
+			try:
+				step = int(name.split("checkpoint-")[1])
+				steps.append((step, name))
+			except ValueError:
+				continue
+
+		if not steps:
+			return None
+
+		_, latest_dir = max(steps, key=lambda x: x[0])
+		return latest_dir
+
+	def _load_checkpoint(self, checkpoint: str):
 		"""Load model checkpoint."""
+		if checkpoint.lower().strip() == "last":
+			checkpoint = self._get_last_checkpoint()
+			if not checkpoint:
+				print(f"No checkpoints found, starting fresh")
+				return
+
+		path = self.model_dir / checkpoint / "checkpoint.pth"
 		try:
-			checkpoint = torch.load(checkpoint_path, map_location='cpu')
+			checkpoint = torch.load(path, map_location='cpu')
 		except:
-			print(f"Failed to load checkpoint '${checkpoint_path}', loading fresh")
+			print(f"Failed to load checkpoint '${str(path)}', starting fresh")
 			return
+
+		self.global_step = checkpoint['step']
 
 		# Load model states
 		self.unet.load_state_dict(checkpoint['unet_state_dict'])
@@ -52,20 +82,19 @@ class DiffusersTrainer:
 		# Load optimizer and scheduler
 		self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 		self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+		print(f"Loaded checkpoint from '{str(path)}'")
 
-		logger.info(f"Loaded checkpoint from {checkpoint_path}")
-
-	def save_checkpoint(self, step: int):
+	def save_checkpoint(self):
 		"""Save model checkpoint."""
-		checkpoint_path = os.path.join(self.model_dir, f"checkpoint-{step}")
-		os.makedirs(checkpoint_path, exist_ok=True)
+		checkpoint_path = self.model_dir / f"checkpoint-{self.global_step}"
+		os.makedirs(str(checkpoint_path), exist_ok=True)
 
 		# Prepare state dicts
 		unet_state = self.accelerator.unwrap_model(self.unet).state_dict()
 		struct_head_state = self.accelerator.unwrap_model(self.struct_head).state_dict()
 
 		checkpoint = {
-			'step': step,
+			'step': self.global_step,
 			'unet_state_dict': unet_state,
 			'struct_head_state_dict': struct_head_state,
 			'optimizer_state_dict': self.optimizer.state_dict(),
@@ -290,6 +319,8 @@ class DiffusersTrainer:
 			self.unet, self.struct_head, self.optimizer, self.lr_scheduler
 		)
 
+		self.global_step = 0
+
 		# Load checkpoint if specified (before EMA creation)
 		if self.from_checkpoint:
 			self._load_checkpoint(self.from_checkpoint)
@@ -300,7 +331,6 @@ class DiffusersTrainer:
 		logger.info(f"Starting training for {num_epochs} epochs, {total_steps} total steps")
 		logger.info(f"Dataset size: {len(dataset)} samples")
 
-		global_step = 0
 		for epoch in range(num_epochs):
 			self.unet.train()
 			self.struct_head.train()
@@ -316,14 +346,14 @@ class DiffusersTrainer:
 				loss_dict = self.train_step(batch)
 				epoch_losses.append(loss_dict["loss"])
 
-				global_step += 1
+				self.global_step += 1
 
 				# Log progress
 				if step % 100 == 0 and self.accelerator.is_main_process:
 					avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
-					tqdm.write(f"Step {global_step}: loss={avg_loss:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
+					tqdm.write(f"Step {self.global_step}: loss={avg_loss:.4f}, block={loss_dict['block_loss']:.4f}, meta={loss_dict['meta_loss']:.4f}")
 
-			self.save_checkpoint(global_step)
+			self.save_checkpoint()
 
 			# End of epoch logging
 			if self.accelerator.is_main_process:
@@ -338,7 +368,7 @@ def main():
 	parser = argparse.ArgumentParser(description="Train 3D Minecraft Structure Generation Model")
 	parser.add_argument("--dataset_dir", type=str, default="./prepared", help="Path to dataset directory")
 	parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
-	parser.add_argument("--from_checkpoint", type=str, default="./checkpoints/checkpoint.pth", help="Path to checkpoint to resume from")
+	parser.add_argument("--from_checkpoint", type=str, default="last", help="Path to checkpoint to resume from. \"last\" to load last checkpoint")
 	parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs")
 	parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
 	parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to use")
