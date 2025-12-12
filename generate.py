@@ -111,28 +111,27 @@ class MCStructurePipeline(DiffusionPipeline):
 			# Create timesteps tensor for the batch
 			timesteps = torch.tensor([t] * batch_size, device=self.device, dtype=torch.long)
 
-			# Expand latents for classifier-free guidance
+			# Expand latents and timesteps for classifier-free guidance
 			latent_model_input = torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
+			timesteps_input = torch.cat([timesteps] * 2) if guidance_scale > 1.0 else timesteps
 			latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
 			# Predict noise
 			if guidance_scale > 1.0:
 				# Separate conditional and unconditional predictions
 				noise_pred_uncond, noise_pred_cond = torch.chunk(
-					self.unet(latent_model_input, timesteps, text_emb), 2
+					self.unet(latent_model_input, timesteps_input, text_emb), 2
 				)
 				# Apply classifier-free guidance
 				noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 			else:
-				noise_pred = self.unet(latent_model_input, timesteps, text_emb)
+				noise_pred = self.unet(latent_model_input, timesteps_input, text_emb)
 
 			# Compute previous noisy sample
 			latents = self.scheduler.step(noise_pred, t, latents).prev_sample
 
-		# Decode latents to structure features
-		with torch.no_grad():
-			timesteps = torch.zeros(batch_size, device=self.device, dtype=torch.long)
-			_, features = self.unet(latents, timesteps, text_emb[:batch_size], return_features=True)
+		# Use final denoised latents as features
+		features = latents
 
 		# Convert features to block IDs and metadata using struct head
 		block_logits, meta_logits = self.struct_head.forward_from_features(features)

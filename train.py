@@ -49,7 +49,7 @@ class DiffusersTrainer:
 			num_train_timesteps=1000,
 			beta_start=0.0001,
 			beta_end=0.02,
-			prediction_type="epsilon",  # Predict noise
+			prediction_type="epsilon",  # UNet predicts noise (better training stability)
 		)
 
 		# Optimizer
@@ -132,6 +132,8 @@ class DiffusersTrainer:
 		device = block_ids.device
 
 		# Encode blocks and metadata into latent space: (B, 1, H, W, D) + (B, M, H, W, D) -> (B, 32, H, W, D)
+		# Initially will be noise (no block embeddings trained)
+		# but after several steps should approximate structure features
 		block_logits, metadata_logits = self.struct_head.logits_from_outputs(block_ids, metadata_flags)
 		encoded_blocks = self.struct_head.backward_to_features(block_logits, metadata_logits)
 		
@@ -147,14 +149,20 @@ class DiffusersTrainer:
 		# Add noise to the encoded block structure
 		noisy_input = self.noise_scheduler.add_noise(encoded_blocks, noise, timesteps)
 		
-		# UNet denoises and returns denoised latent (B, 32, D, H, W)
-		denoised_latent = self.unet(noisy_input, timesteps, text_embeddings)
+		# UNet predicts the noise (epsilon prediction)
+		noise_pred = self.unet(noisy_input, timesteps, text_embeddings)
+
+		# Loss 1: Denoising loss (predict the noise that was added)
+		denoise_loss = F.mse_loss(noise_pred, noise)
+		
+		# For classification, reconstruct denoised latent from noise prediction
+		# x_0 = (x_t - sqrt(1 - alpha_bar_t) * epsilon_pred) / sqrt(alpha_bar_t)
+		alpha_prod_t = self.noise_scheduler.alphas_cumprod[timesteps]
+		alpha_prod_t = alpha_prod_t.view(-1, 1, 1, 1, 1)  # Reshape for broadcasting
+		denoised_latent = (noisy_input - torch.sqrt(1 - alpha_prod_t) * noise_pred) / torch.sqrt(alpha_prod_t)
 
 		# Get logits from struct_head using denoised latent
 		block_logits, meta_logits = self.struct_head.forward_from_features(denoised_latent)
-
-		# Loss 1: Denoising loss (reconstruct encoded blocks from denoised latent)
-		denoise_loss = F.mse_loss(denoised_latent, encoded_blocks)
 
 		# Loss 2: Block classification loss
 		K, H, W, D = block_logits.shape[1:]
