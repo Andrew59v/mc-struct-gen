@@ -352,7 +352,7 @@ class UNet3DConditional(nn.Module):
 				return encoder_hidden_states.unsqueeze(1)
 		raise ValueError("encoder_hidden_states must be shape (B, C) or (B, L, C)")
 
-	def forward(self, x: torch.Tensor, timesteps: torch.Tensor, encoder_hidden_states: torch.Tensor, return_features: bool = False) -> torch.Tensor:
+	def forward(self, x: torch.Tensor, timesteps: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
 		assert x.dim() == 5, "Input must be (B, C, D, H, W)"
 		# initial conv
 		h = self.init_conv(x)
@@ -388,9 +388,7 @@ class UNet3DConditional(nn.Module):
 		h_cur = self.final_act(self.final_norm(h_cur))
 		out = self.final_conv(h_cur)
 
-		if return_features:
-			# return both diffusion output and pre-final features
-			return out, h_cur
+		# Return denoised latent representation (B, 32, D, H, W)
 		return out
 
 

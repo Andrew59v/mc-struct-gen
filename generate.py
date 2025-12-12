@@ -203,7 +203,7 @@ def main():
 	"""Demo generation using diffusers pipeline."""
 	parser = argparse.ArgumentParser(description="Generate 3D Minecraft Structures with Diffusers")
 	parser.add_argument("--model_path", type=str, default="./checkpoints/checkpoint.pt", help="Path to trained model weights")
-	parser.add_argument("--prompt", type=str, default="Tower", help="Text description of structure")
+	parser.add_argument("--prompt", type=str, default="House", help="Text description of structure")
 	parser.add_argument("--steps", type=int, default=100, help="Number of inference steps")
 	parser.add_argument("--guidance_scale", type=float, default=3.0, help="Classifier-free guidance scale")
 	parser.add_argument("--height", type=int, default=32, help="Structure height")

@@ -20,7 +20,7 @@ class MCStructEmbedHead(nn.Module):
         model: Optional[UNet3DConditional],
         num_blocks: int = 512,
         meta_dim: int = 32,
-        feat_channels: Optional[int] = None,
+        feat_channels: int = 32,
         embed_dim: int = 64,
         projector_hidden: Optional[int] = 128,
         normalize_embeddings: bool = True,
@@ -51,13 +51,7 @@ class MCStructEmbedHead(nn.Module):
         self.normalize = normalize_embeddings
         self.temperature = float(temperature)
 
-        # infer feat_channels if not provided
-        if feat_channels is None:
-            if model is not None and hasattr(model, "final_norm") and hasattr(model.final_norm, "num_channels"):
-                feat_channels = model.final_norm.num_channels
-            else:
-                raise ValueError("feat_channels not provided and could not be inferred. "
-                                 "Pass feat_channels or attach model with final_norm.")
+        # feat_channels is the output dimension of final_conv (32 by default)
         self.feat_channels = feat_channels
 
         # projector: maps feat_channels -> embed_dim per voxel
@@ -171,6 +165,99 @@ class MCStructEmbedHead(nn.Module):
 
         return block_ids, meta_flags
 
+    def backward_to_features(
+        self,
+        block_logits: torch.Tensor,
+        meta_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Convert logits back to feature space (inverse of forward_from_features).
+        
+        Reconstructs features from classification logits by finding the best matching
+        block embedding and combining with metadata information.
+
+        Args:
+            block_logits: (B, K, D, H, W) - block classification logits
+            meta_logits: (B, M, D, H, W) - metadata logits
+
+        Returns:
+            features: (B, F, D, H, W) - reconstructed features for UNet
+        """
+        B, K, D, H, W = block_logits.shape
+        device = block_logits.device
+        
+        # Get block IDs from logits
+        block_ids = torch.argmax(block_logits, dim=1)  # (B, D, H, W)
+        block_ids = torch.clamp(block_ids, 0, self.num_blocks - 1)
+        
+        # Retrieve block embeddings
+        block_embed = self.block_embeddings[block_ids]  # (B, D, H, W, embed_dim)
+        block_embed = block_embed.permute(0, 4, 1, 2, 3).contiguous()  # (B, embed_dim, D, H, W)
+        
+        # Concatenate with metadata
+        combined = torch.cat([block_embed, meta_logits], dim=1)  # (B, embed_dim+M, D, H, W)
+        
+        # Project to feat_channels
+        C = combined.shape[1]
+        if C > self.feat_channels:
+            # Reduce by averaging across grouped channels
+            pool_size = C // self.feat_channels
+            combined_reshaped = combined.view(B, self.feat_channels, pool_size, D, H, W)
+            features = combined_reshaped.mean(dim=2)
+        elif C < self.feat_channels:
+            # Pad with zeros
+            features = F.pad(combined, (0, 0, 0, 0, 0, 0, 0, self.feat_channels - C))
+        else:
+            features = combined
+        
+        return features 
+
+    def logits_from_outputs(
+        self,
+        block_ids: torch.Tensor,
+        metadata_flags: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert discrete outputs back to logits (inverse of logits_to_outputs).
+        
+        Reconstructs logits from ground truth block IDs and metadata flags
+        for encoding into the diffusion model.
+
+        Args:
+            block_ids: (B, 1, D, H, W) torch.long - discrete block IDs (0-511)
+            metadata_flags: (B, M, D, H, W) torch.float - binary metadata (0/1)
+
+        Returns:
+            block_logits: (B, K, D, H, W) - reconstructed block classification logits
+            meta_logits: (B, M, D, H, W) - reconstructed metadata logits
+        """
+        B, _, D, H, W = block_ids.shape
+        K = self.num_blocks
+        device = block_ids.device
+        
+        block_ids_flat = block_ids.squeeze(1).long()  # (B, D, H, W)
+        block_ids_flat = torch.clamp(block_ids_flat, 0, K - 1)
+        
+        # Create one-hot style logits: high value for correct class, low for others
+        block_logits = torch.full((B, K, D, H, W), -10.0, device=device, dtype=torch.float32)
+        
+        # Vectorized assignment: set correct class logits to 10.0
+        b_idx = torch.arange(B, device=device)[:, None, None, None].expand(B, D, H, W)
+        d_idx = torch.arange(D, device=device)[None, :, None, None].expand(B, D, H, W)
+        h_idx = torch.arange(H, device=device)[None, None, :, None].expand(B, D, H, W)
+        w_idx = torch.arange(W, device=device)[None, None, None, :].expand(B, D, H, W)
+        
+        block_logits[b_idx, block_ids_flat, d_idx, h_idx, w_idx] = 10.0
+        
+        # Convert metadata flags (0/1) to logits using log-odds style
+        meta_logits = torch.where(
+            metadata_flags > 0.5,
+            torch.full_like(metadata_flags, 5.0),
+            torch.full_like(metadata_flags, -5.0)
+        )
+        
+        return block_logits, meta_logits
+
     def forward(
         self,
         x: torch.Tensor,
@@ -182,13 +269,10 @@ class MCStructEmbedHead(nn.Module):
         if self.model is None:
             raise RuntimeError("No UNet model attached. Use forward_from_features(...) instead or instantiate with model.")
 
-        out = self.model(x, timesteps, encoder_hidden_states, return_features=True)
-        if isinstance(out, (tuple, list)):
-            _, features = out
-        else:
-            raise RuntimeError("UNet.forward did not return (out, features). Pass return_features=True.")
+        # UNet returns denoised latent (B, 32, D, H, W)
+        latents = self.model(x, timesteps, encoder_hidden_states)
         
-        logits, meta_logits = self.forward_from_features(features)
+        logits, meta_logits = self.forward_from_features(latents)
         if return_logits:
             return logits, meta_logits
         else:

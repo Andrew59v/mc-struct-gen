@@ -123,7 +123,7 @@ class DiffusersTrainer:
 		logger.info(f"Saved checkpoint to {checkpoint_path}")
 
 	def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-		"""Single training step: denoise + classify blocks and metadata."""
+		"""Single training step: encode blocks, add noise, denoise, classify."""
 		block_ids = batch['block_ids']  # (B, 1, H, W, D)
 		metadata_flags = batch['metadata_flags']  # (B, M, H, W, D)
 		text_embeddings = batch['text_embedding']  # (B, 77, 512)
@@ -131,8 +131,12 @@ class DiffusersTrainer:
 		B = block_ids.shape[0]
 		device = block_ids.device
 
-		# Generate random noise as initial unstructured voxels
-		noise = torch.randn(B, 32, *block_ids.shape[2:], device=device)
+		# Encode blocks and metadata into latent space: (B, 1, H, W, D) + (B, M, H, W, D) -> (B, 32, H, W, D)
+		block_logits, metadata_logits = self.struct_head.logits_from_outputs(block_ids, metadata_flags)
+		encoded_blocks = self.struct_head.backward_to_features(block_logits, metadata_logits)
+		
+		# Generate random noise with same shape as encoded blocks
+		noise = torch.randn_like(encoded_blocks)
 		
 		# Sample random timesteps for diffusion
 		timesteps = torch.randint(
@@ -140,22 +144,17 @@ class DiffusersTrainer:
 			(B,), device=device
 		)
 		
-		# Add noise at timestep t (simulates diffusion forward process)
-		noisy_input = self.noise_scheduler.add_noise(noise, noise, timesteps)
+		# Add noise to the encoded block structure
+		noisy_input = self.noise_scheduler.add_noise(encoded_blocks, noise, timesteps)
 		
-		# UNet predicts noise and extracts features
-		unet_out = self.unet(noisy_input, timesteps, text_embeddings, return_features=True)
-		
-		if isinstance(unet_out, (tuple, list)):
-			noise_pred, features = unet_out
-		else:
-			raise RuntimeError("UNet.forward did not return (out, features)")
+		# UNet denoises and returns denoised latent (B, 32, D, H, W)
+		denoised_latent = self.unet(noisy_input, timesteps, text_embeddings)
 
-		# Get logits from struct_head
-		block_logits, meta_logits = self.struct_head.forward_from_features(features)
+		# Get logits from struct_head using denoised latent
+		block_logits, meta_logits = self.struct_head.forward_from_features(denoised_latent)
 
-		# Loss 1: Denoising loss (predict the noise that was added)
-		denoise_loss = F.mse_loss(noise_pred, noise)
+		# Loss 1: Denoising loss (reconstruct encoded blocks from denoised latent)
+		denoise_loss = F.mse_loss(denoised_latent, encoded_blocks)
 
 		# Loss 2: Block classification loss
 		K, H, W, D = block_logits.shape[1:]
@@ -167,10 +166,8 @@ class DiffusersTrainer:
 		meta_loss = F.binary_cross_entropy_with_logits(meta_logits, metadata_flags.float())
 
 		# Combine losses with weights
-		# Scale meta_loss by 50 because metadata is often zero, making BCE loss very small (< 0.01)
-		# This ensures metadata contributes meaningfully to training despite sparsity
-		# initial (for reference): denoise=1.0962, block=5.8414, meta=0.6069
-		loss = 0.5 * denoise_loss + 0.3 * block_loss + 50 * meta_loss
+		# denoise_loss as regularization (lower weight), block+meta losses are primary
+		loss = 0.1 * denoise_loss + 0.5 * block_loss + 50 * meta_loss
 
 		# Backpropagate
 		self.accelerator.backward(loss)
