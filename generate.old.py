@@ -54,7 +54,7 @@ if __name__ == "__main__":
 	shape = (1, 32, 8, 8, 8)
 
 	unet = UNet3DConditional(in_channels=shape[1], out_channels=shape[1]).to(DEVICE)
-	head = MCStructEmbedHead(unet, num_blocks=12, meta_dim=4, feat_channels=None, embed_dim=shape[1]*2, projector_hidden=128).to(DEVICE)
+	head = MCStructEmbedHead(unet, num_blocks=12, meta_dim=4, feat_channels=None, embed_dim=shape[1]*2).to(DEVICE)
 	clip_model, _ = clip.load("ViT-B/32", device=DEVICE)
 	scheduler = NoiseScheduler(num_timesteps=1000).to(DEVICE)
 	print("Models loaded successfully.")

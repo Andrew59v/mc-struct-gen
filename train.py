@@ -34,59 +34,20 @@ class DiffusersTrainer:
 		self.model_dir = model_dir
 		self.from_checkpoint = from_checkpoint
 
-		# Initialize accelerator for distributed training
-		self.accelerator = Accelerator(
-			gradient_accumulation_steps=1,
-			mixed_precision="fp16",  # Enable mixed precision
-		)
-
-		# Initialize models
-		self.unet = UNet3DConditional()
-		self.struct_head = MCStructEmbedHead(self.unet)
-
-		# Diffusers noise scheduler (DDPM)
-		self.noise_scheduler = DDPMScheduler(
-			num_train_timesteps=1000,
-			beta_start=0.0001,
-			beta_end=0.02,
-			prediction_type="epsilon",  # UNet predicts noise (better training stability)
-		)
-
-		# Optimizer
-		self.optimizer = torch.optim.AdamW(
-			list(self.unet.parameters()) + list(self.struct_head.parameters()),
-			lr=1e-4,
-			weight_decay=1e-6,
-		)
-
-		# Learning rate scheduler
-		self.lr_scheduler = get_scheduler(
-			"cosine",
-			optimizer=self.optimizer,
-			num_warmup_steps=500,
-			num_training_steps=100000,  # Will be updated based on actual steps
-		)
-
-		# Prepare with accelerator
-		self.unet, self.struct_head, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
-			self.unet, self.struct_head, self.optimizer, self.lr_scheduler
-		)
-
-		# EMA model for stable training (create after accelerator.prepare)
-		self.ema_unet = EMAModel(self.unet, inv_gamma=1.0, power=2/3, max_value=0.9999)
-
-		# Load checkpoint if specified
-		if from_checkpoint:
-			self._load_checkpoint(from_checkpoint)
-
 	def _load_checkpoint(self, checkpoint_path: str):
 		"""Load model checkpoint."""
-		checkpoint = torch.load(checkpoint_path, map_location='cpu')
+		try:
+			checkpoint = torch.load(checkpoint_path, map_location='cpu')
+		except:
+			print(f"Failed to load checkpoint '${checkpoint_path}', loading fresh")
+			return
 
 		# Load model states
 		self.unet.load_state_dict(checkpoint['unet_state_dict'])
 		self.struct_head.load_state_dict(checkpoint['struct_head_state_dict'])
-		self.ema_unet.load_state_dict(checkpoint['ema_unet_state_dict'])
+
+		# Skip EMA loading - not using EMA for now
+		pass
 
 		# Load optimizer and scheduler
 		self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -102,20 +63,17 @@ class DiffusersTrainer:
 		# Prepare state dicts
 		unet_state = self.accelerator.unwrap_model(self.unet).state_dict()
 		struct_head_state = self.accelerator.unwrap_model(self.struct_head).state_dict()
-		ema_state = self.ema_unet.state_dict()
 
 		checkpoint = {
 			'step': step,
 			'unet_state_dict': unet_state,
 			'struct_head_state_dict': struct_head_state,
-			'ema_unet_state_dict': ema_state,
 			'optimizer_state_dict': self.optimizer.state_dict(),
 			'scheduler_state_dict': self.lr_scheduler.state_dict(),
 			'config': {
 				'num_blocks': self.struct_head.num_blocks,
 				'meta_dim': self.struct_head.meta_dim,
 				'embed_dim': self.struct_head.embed_dim,
-				'projector_hidden': self.struct_head.projector_hidden,
 			}
 		}
 
@@ -174,8 +132,14 @@ class DiffusersTrainer:
 		meta_loss = F.binary_cross_entropy_with_logits(meta_logits, metadata_flags.float())
 
 		# Combine losses with weights
-		# denoise_loss as regularization (lower weight), block+meta losses are primary
-		loss = 0.1 * denoise_loss + 0.5 * block_loss + 50 * meta_loss
+		# Balanced weighting: block classification primary, denoising as regularization, metadata as auxiliary
+		loss = 0.2 * denoise_loss + 0.6 * block_loss + 0.2 * meta_loss
+
+		# Check for NaN/inf losses (debugging)
+		if torch.isnan(loss) or torch.isinf(loss):
+			print(f"NaN/inf detected: denoise={denoise_loss.item():.4f}, block={block_loss.item():.4f}, meta={meta_loss.item():.4f}")
+			# Replace with a reasonable fallback
+			loss = torch.tensor(10.0, device=loss.device, requires_grad=True)
 
 		# Backpropagate
 		self.accelerator.backward(loss)
@@ -190,10 +154,6 @@ class DiffusersTrainer:
 		self.optimizer.step()
 		self.lr_scheduler.step()
 		self.optimizer.zero_grad()
-
-		# Update EMA model
-		if self.accelerator.sync_gradients:
-			self.ema_unet.step(self.unet.parameters())
 
 		return {
 			"loss": loss.item(),
@@ -288,20 +248,54 @@ class DiffusersTrainer:
 			pin_memory=True,
 			collate_fn=collate_fn,
 		)
+		
+		# Initialize accelerator for distributed training
+		self.accelerator = Accelerator(
+			gradient_accumulation_steps=gradient_accumulation_steps,
+			mixed_precision="fp16",  # Enable mixed precision
+		)
 
-		# Prepare dataloader with accelerator
-		dataloader = self.accelerator.prepare(dataloader)
+		# Initialize models
+		self.unet = UNet3DConditional()
+		self.struct_head = MCStructEmbedHead(self.unet)
+
+		# Diffusers noise scheduler (DDPM)
+		self.noise_scheduler = DDPMScheduler(
+			num_train_timesteps=1000,
+			beta_start=0.0001,
+			beta_end=0.02,
+			prediction_type="epsilon",  # UNet predicts noise (better training stability)
+		)
+
+		# Optimizer
+		self.optimizer = torch.optim.AdamW(
+			list(self.unet.parameters()) + list(self.struct_head.parameters()),
+			lr=1e-4,
+			weight_decay=1e-6,
+		)
 
 		# Calculate total training steps
 		total_steps = len(dataloader) * num_epochs // gradient_accumulation_steps
 
-		# Update scheduler with correct number of steps
+		# Learning rate scheduler
 		self.lr_scheduler = get_scheduler(
 			"cosine",
 			optimizer=self.optimizer,
 			num_warmup_steps=500,
 			num_training_steps=total_steps,
 		)
+
+		# Prepare with accelerator
+		self.unet, self.struct_head, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+			self.unet, self.struct_head, self.optimizer, self.lr_scheduler
+		)
+
+		# Load checkpoint if specified (before EMA creation)
+		if self.from_checkpoint:
+			self._load_checkpoint(self.from_checkpoint)
+
+		# Prepare dataloader with accelerator
+		dataloader = self.accelerator.prepare(dataloader)
 
 		logger.info(f"Starting training for {num_epochs} epochs, {total_steps} total steps")
 		logger.info(f"Dataset size: {len(dataset)} samples")
@@ -344,7 +338,7 @@ def main():
 	parser = argparse.ArgumentParser(description="Train 3D Minecraft Structure Generation Model")
 	parser.add_argument("--dataset_dir", type=str, default="./prepared", help="Path to dataset directory")
 	parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Output directory for checkpoints")
-	parser.add_argument("--from_checkpoint", type=str, default=None, help="Path to checkpoint to resume from")
+	parser.add_argument("--from_checkpoint", type=str, default="./checkpoints/checkpoint.pth", help="Path to checkpoint to resume from")
 	parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs")
 	parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
 	parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to use")

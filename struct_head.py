@@ -19,59 +19,33 @@ class MCStructEmbedHead(nn.Module):
         self,
         model: Optional[UNet3DConditional],
         num_blocks: int = 512,
+        embed_dim: int = 32,
         meta_dim: int = 32,
-        feat_channels: int = 32,
-        embed_dim: int = 64,
-        projector_hidden: Optional[int] = 128,
         normalize_embeddings: bool = True,
         temperature: float = 1.0,
         freeze_embeddings: bool = False,
-        dropout: float = 0.0,
     ):
         """
         Args:
             model: optional UNet instance for convenience `forward(...)`.
             num_blocks: number of block classes (K).
+            embed_dim: channels in UNet features (embeddings will match this dimension).
             meta_dim: number of binary metadata channels.
-            feat_channels: channels in UNet features (if None, attempt to infer).
-            embed_dim: dimension of the learned block embeddings.
-            projector_hidden: if provided, uses a small MLP (conv1x1 -> SiLU -> conv1x1) to map features -> embed_dim.
-                              if None, uses single 1x1 conv projection.
-            normalize_embeddings: if True, l2-normalize embeddings and projected features (cosine-sim).
+            normalize_embeddings: if True, l2-normalize embeddings and features (cosine-sim).
             temperature: scalar dividing logits (higher -> softer).
             freeze_embeddings: if True, embeddings won't be updated.
-            dropout: dropout in projector if projector_hidden provided.
         """
         super().__init__()
         self.model = model
         self.num_blocks = num_blocks
-        self.meta_dim = meta_dim
         self.embed_dim = embed_dim
-        self.projector_hidden = projector_hidden
+        self.meta_dim = meta_dim
         self.normalize = normalize_embeddings
         self.temperature = float(temperature)
 
-        # feat_channels is the output dimension of final_conv (32 by default)
-        self.feat_channels = feat_channels
+        self.feat_dim = embed_dim
 
-        # projector: maps feat_channels -> embed_dim per voxel
-        if projector_hidden is None:
-            # single 1x1 conv
-            self.projector = nn.Sequential(
-                nn.Conv3d(self.feat_channels, embed_dim, kernel_size=1),
-                nn.Dropout(dropout) if (dropout and dropout > 0.0) else nn.Identity()
-            )
-        else:
-            # two-layer bottleneck MLP: 1x1 conv -> act -> 1x1 conv
-            self.projector = nn.Sequential(
-                nn.Conv3d(self.feat_channels, projector_hidden, kernel_size=1),
-                nn.GroupNorm(num_groups=min(8, max(1, projector_hidden)), num_channels=projector_hidden, eps=1e-6),
-                nn.SiLU(),
-                nn.Dropout(dropout) if (dropout and dropout > 0.0) else nn.Identity(),
-                nn.Conv3d(projector_hidden, embed_dim, kernel_size=1),
-            )
-
-        # learnable block embeddings (prototypes)
+        # learnable block embeddings (prototypes) - now same dim as features
         self.block_embeddings = nn.Parameter(torch.randn(num_blocks, embed_dim))
         if freeze_embeddings:
             self.block_embeddings.requires_grad = False
@@ -80,7 +54,15 @@ class MCStructEmbedHead(nn.Module):
         self.class_bias = nn.Parameter(torch.zeros(num_blocks))
 
         # metadata head (logits)
-        self.meta_head = nn.Conv3d(self.feat_channels, meta_dim, kernel_size=1)
+        self.meta_head = nn.Conv3d(self.feat_dim, meta_dim, kernel_size=1)
+
+        # Feature modulation: metadata -> modulation parameters for blocks
+        # Generate scale/shift from metadata to modulate block features (FiLM-style)
+        self.meta_to_modulation = nn.Sequential(
+            nn.Conv3d(meta_dim, embed_dim * 2, kernel_size=1),  # scale + shift
+            nn.GroupNorm(num_groups=min(8, embed_dim), num_channels=embed_dim * 2, eps=1e-6),
+            nn.SiLU(),
+        )
 
         # init
         self._init_weights()
@@ -112,22 +94,20 @@ class MCStructEmbedHead(nn.Module):
         """
         B, C, D, H, W = features.shape
 
-        # project features to embedding space
-        proj = self.projector(features)  # (B, embed_dim, D, H, W)
-        
+        # No projection needed - direct similarity with features (embed_dim = feat_channels)
         # optionally normalize
         if self.normalize:
-            proj_flat = proj.view(B, self.embed_dim, -1)
-            proj_norm = F.normalize(proj_flat, dim=1)  # (B, embed_dim, N)
-            emb = F.normalize(self.block_embeddings, dim=1)  # (K, embed_dim)
+            feat_flat = features.view(B, self.feat_dim, -1)
+            feat_norm = F.normalize(feat_flat, dim=1)  # (B, feat_channels, N)
+            emb = F.normalize(self.block_embeddings, dim=1)  # (K, feat_channels)
         else:
-            proj_norm = proj.view(B, self.embed_dim, -1)
-            emb = self.block_embeddings  # (K, embed_dim)
+            feat_norm = features.view(B, self.feat_dim, -1)
+            emb = self.block_embeddings  # (K, feat_channels)
 
         # compute dot product logits: (B, E, N) @ (E, K) -> (B, N, K) -> (B, K, N)
-        proj_perm = proj_norm.permute(0, 2, 1)  # (B, N, E)
+        feat_perm = feat_norm.permute(0, 2, 1)  # (B, N, E)
         emb_t = emb.t()  # (E, K)
-        logits = torch.matmul(proj_perm, emb_t)  # (B, N, K)
+        logits = torch.matmul(feat_perm, emb_t)  # (B, N, K)
         logits = logits.permute(0, 2, 1).contiguous()  # (B, K, N)
 
         # scale by temperature and add per-class bias
@@ -137,7 +117,7 @@ class MCStructEmbedHead(nn.Module):
 
         # metadata: simple 1x1 conv over original features
         meta_logits = self.meta_head(features)  # (B, M, D, H, W)
-        
+
         return logits, meta_logits
     
     def logits_to_outputs(
@@ -171,10 +151,10 @@ class MCStructEmbedHead(nn.Module):
         meta_logits: torch.Tensor
     ) -> torch.Tensor:
         """
-        Convert logits back to feature space (inverse of forward_from_features).
-        
-        Reconstructs features from classification logits by finding the best matching
-        block embedding and combining with metadata information.
+        Convert logits back to feature space using FiLM-style modulation.
+
+        Reconstructs features by modulating predicted block embeddings with metadata,
+        maintaining separation between blocks and metadata information.
 
         Args:
             block_logits: (B, K, D, H, W) - block classification logits
@@ -183,33 +163,28 @@ class MCStructEmbedHead(nn.Module):
         Returns:
             features: (B, F, D, H, W) - reconstructed features for UNet
         """
-        B, K, D, H, W = block_logits.shape
-        device = block_logits.device
-        
-        # Get block IDs from logits
+        # Get predicted block classes
         block_ids = torch.argmax(block_logits, dim=1)  # (B, D, H, W)
         block_ids = torch.clamp(block_ids, 0, self.num_blocks - 1)
-        
-        # Retrieve block embeddings
-        block_embed = self.block_embeddings[block_ids]  # (B, D, H, W, embed_dim)
-        block_embed = block_embed.permute(0, 4, 1, 2, 3).contiguous()  # (B, embed_dim, D, H, W)
-        
-        # Concatenate with metadata
-        combined = torch.cat([block_embed, meta_logits], dim=1)  # (B, embed_dim+M, D, H, W)
-        
-        # Project to feat_channels
-        C = combined.shape[1]
-        if C > self.feat_channels:
-            # Reduce by averaging across grouped channels
-            pool_size = C // self.feat_channels
-            combined_reshaped = combined.view(B, self.feat_channels, pool_size, D, H, W)
-            features = combined_reshaped.mean(dim=2)
-        elif C < self.feat_channels:
-            # Pad with zeros
-            features = F.pad(combined, (0, 0, 0, 0, 0, 0, 0, self.feat_channels - C))
-        else:
-            features = combined
-        
+
+        # Get corresponding block embeddings (base features)
+        block_embeddings = self.block_embeddings[block_ids]  # (B, D, H, W, embed_dim)
+        block_embeddings = block_embeddings.permute(0, 4, 1, 2, 3)  # (B, embed_dim, D, H, W)
+
+        # Generate modulation parameters from metadata
+        modulation_params = self.meta_to_modulation(meta_logits)  # (B, embed_dim * 2, D, H, W)
+        scale, shift = modulation_params.chunk(2, dim=1)  # Each: (B, embed_dim, D, H, W)
+
+        # Stabilize modulation parameters to prevent extreme values
+        scale = torch.clamp(scale, -2.0, 2.0)  # Prevent extreme scaling
+        shift = torch.clamp(shift, -1.0, 1.0)  # Prevent extreme shifting
+
+        # Apply FiLM modulation: modulated = scale * base + shift
+        modulated_blocks = scale * block_embeddings + shift
+
+        # embed_dim = feat_channels, so no dimension conversion needed
+        features = modulated_blocks
+
         return features 
 
     def logits_from_outputs(
@@ -250,10 +225,12 @@ class MCStructEmbedHead(nn.Module):
         block_logits[b_idx, block_ids_flat, d_idx, h_idx, w_idx] = 10.0
         
         # Convert metadata flags (0/1) to logits using log-odds style
+        # Ensure we're working with float tensors
+        metadata_float = metadata_flags.float()
         meta_logits = torch.where(
-            metadata_flags > 0.5,
-            torch.full_like(metadata_flags, 5.0),
-            torch.full_like(metadata_flags, -5.0)
+            metadata_float > 0.5,
+            torch.full_like(metadata_float, 5.0),
+            torch.full_like(metadata_float, -5.0)
         )
         
         return block_logits, meta_logits
