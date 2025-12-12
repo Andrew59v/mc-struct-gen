@@ -204,7 +204,7 @@ if __name__ == "__main__":
 
     # create unet and attach head (unet must support return_features=True)
     unet = UNet3DConditional()
-    head = MCStructEmbedHead(unet, num_blocks=12, meta_dim=4, feat_channels=None, embed_dim=128, projector_hidden=256)
+    head = MCStructEmbedHead(unet)
 
     block_id, meta_bits = head(x, timesteps, text_emb)
 

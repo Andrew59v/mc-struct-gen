@@ -3,6 +3,7 @@ Generation script using diffusers pipeline for 3D Minecraft structure generation
 Replaces the custom generation loop in main.py with diffusers' professional inference pipeline.
 """
 
+import os
 import clip
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ import argparse
 from diffusers import DiffusionPipeline, DDPMScheduler
 from accelerate import Accelerator
 
-from model import get_text_embedding, UNet3DConditional
+from model import get_text_embedding, print_slices, UNet3DConditional
 from struct_head import MCStructEmbedHead
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -52,9 +53,9 @@ class MCStructurePipeline(DiffusionPipeline):
 	def __call__(
 		self,
 		prompt: str,
-		height: int = 8,
-		width: int = 8,
-		depth: int = 8,
+		height: int = 16,
+		width: int = 16,
+		depth: int = 16,
 		num_inference_steps: int = 50,
 		guidance_scale: float = 5.0,
 		num_images_per_prompt: int = 1,
@@ -134,22 +135,13 @@ class MCStructurePipeline(DiffusionPipeline):
 			_, features = self.unet(latents, timesteps, text_emb[:batch_size], return_features=True)
 
 		# Convert features to block IDs and metadata using struct head
-		block_id, meta_bits, block_logits, meta_logits = self.struct_head.forward_from_features(
-			features, return_logits=True
-		)
-
-		# Prepare output
-		output = {
-			"block_id": block_id,
-			"meta_bits": meta_bits,
-			"features": features,
-			"latents": latents,
-		}
+		block_logits, meta_logits = self.struct_head.forward_from_features(features)
+		block_ids, meta_bits = self.struct_head.logits_to_outputs(block_logits, meta_logits)
 
 		if return_dict:
-			return output
+			return { "block_ids": block_ids, "meta_bits": meta_bits }
 		else:
-			return (block_id, meta_bits, features, latents)
+			return (block_ids, meta_bits)
 
 def create_diffusers_pipeline(
 	model_path: Optional[str] = None,
@@ -166,11 +158,8 @@ def create_diffusers_pipeline(
 		MCStructurePipeline ready for generation
 	"""
 	# Initialize models
-	unet = UNet3DConditional(in_channels=32, out_channels=32)
-	struct_head = MCStructEmbedHead(
-		unet, num_blocks=12, meta_dim=4,
-		embed_dim=64, projector_hidden=128
-	)
+	unet = UNet3DConditional()
+	struct_head = MCStructEmbedHead(unet)
 
 	# Load CLIP model
 	clip_model, _ = clip.load("ViT-B/32", device=device)
@@ -183,27 +172,21 @@ def create_diffusers_pipeline(
 		prediction_type="epsilon",
 	)
 
-	# Load saved weights if provided
-	if model_path is not None:
-		import os
-		unet_path = os.path.join(model_path, "unet.pth")
-		struct_head_path = os.path.join(model_path, "struct_head.pth")
-
-		if os.path.exists(unet_path):
-			unet.load_state_dict(torch.load(unet_path, map_location=device))
-			print(f"Loaded UNet from {unet_path}")
-		else:
-			print(f"Warning: UNet weights not found at {unet_path}")
-
-		if os.path.exists(struct_head_path):
-			struct_head.load_state_dict(torch.load(struct_head_path, map_location=device))
-			print(f"Loaded struct head from {struct_head_path}")
-		else:
-			print(f"Warning: Struct head weights not found at {struct_head_path}")
-
 	# Move to device
 	unet = unet.to(device)
 	struct_head = struct_head.to(device)
+
+	# Load saved weights if provided
+	if model_path is not None and os.path.exists(model_path):
+		checkpoint = torch.load(model_path, map_location=device)
+		
+		# Load UNet and StructHead state dicts
+		if 'unet_state_dict' in checkpoint:
+			unet.load_state_dict(checkpoint['unet_state_dict'])
+		if 'struct_head_state_dict' in checkpoint:
+			struct_head.load_state_dict(checkpoint['struct_head_state_dict'])
+		
+		print(f"Loaded checkpoint from {model_path} (step {checkpoint.get('step', 'unknown')})")
 
 	# Create pipeline
 	pipeline = MCStructurePipeline(
@@ -216,51 +199,16 @@ def create_diffusers_pipeline(
 
 	return pipeline
 
-def generate_structure_diffusers(
-	pipeline: MCStructurePipeline,
-	prompt: str,
-	shape: Tuple[int, int, int, int, int] = (1, 32, 8, 8, 8),
-	steps: int = 50,
-	guidance_scale: float = 5.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""
-	Generate structure using diffusers pipeline (drop-in replacement for original function).
-
-	Args:
-		pipeline: MCStructurePipeline instance
-		prompt: Text description
-		shape: (batch_size, channels, height, width, depth)
-		steps: Number of inference steps
-		guidance_scale: Classifier-free guidance scale
-
-	Returns:
-		Same format as original: (block_id, meta_bits, block_logits, meta_logits)
-	"""
-	batch_size, channels, height, width, depth = shape
-
-	# Generate using diffusers pipeline
-	output = pipeline(
-		prompt=prompt,
-		height=height,
-		width=width,
-		depth=depth,
-		num_inference_steps=steps,
-		guidance_scale=guidance_scale,
-		num_images_per_prompt=batch_size,
-	)
-
-	return output["block_id"], output["meta_bits"], output["block_logits"], output["meta_logits"]
-
 def main():
 	"""Demo generation using diffusers pipeline."""
 	parser = argparse.ArgumentParser(description="Generate 3D Minecraft Structures with Diffusers")
-	parser.add_argument("--model_path", type=str, default=None, help="Path to trained model weights")
-	parser.add_argument("--prompt", type=str, default="A simple house", help="Text description of structure")
-	parser.add_argument("--steps", type=int, default=50, help="Number of inference steps")
-	parser.add_argument("--guidance_scale", type=float, default=5.0, help="Classifier-free guidance scale")
-	parser.add_argument("--height", type=int, default=8, help="Structure height")
-	parser.add_argument("--width", type=int, default=8, help="Structure width")
-	parser.add_argument("--depth", type=int, default=8, help="Structure depth")
+	parser.add_argument("--model_path", type=str, default="./checkpoints/checkpoint.pt", help="Path to trained model weights")
+	parser.add_argument("--prompt", type=str, default="Tower", help="Text description of structure")
+	parser.add_argument("--steps", type=int, default=100, help="Number of inference steps")
+	parser.add_argument("--guidance_scale", type=float, default=3.0, help="Classifier-free guidance scale")
+	parser.add_argument("--height", type=int, default=32, help="Structure height")
+	parser.add_argument("--width", type=int, default=16, help="Structure width")
+	parser.add_argument("--depth", type=int, default=16, help="Structure depth")
 
 	args = parser.parse_args()
 
@@ -277,9 +225,12 @@ def main():
 		guidance_scale=args.guidance_scale,
 	)
 
-	block_id = output["block_id"]
-	print(f"Generated structure shape: {block_id.shape}")
-	print(f"Block ID range: {block_id.min().item()} - {block_id.max().item()}")
+	block_ids = output["block_ids"].squeeze(0).squeeze(0)  # (D, H, W)
+	meta_bits = output["meta_bits"].squeeze(0)  # (M, D, H, W)
+	print(f"Generated structure shape: {block_ids.shape}")
+	print(f"Block ID range: {block_ids.min().item()} - {block_ids.max().item()}")
+
+	print_slices(block_ids, meta_bits)
 
 if __name__ == "__main__":
 	main()

@@ -9,7 +9,7 @@ from diffusers.models.embeddings import Timesteps
 
 import clip
 
-# ----------------------------- CLIP Text Embedding Helper -----------------
+# ----------------------------- Utils -----------------
 def get_text_embedding(clip_model, prompts: list, device = "cpu") -> torch.Tensor:
 		with torch.no_grad():
 				text_tokens = clip.tokenize(prompts, truncate=True)
@@ -27,6 +27,33 @@ def get_text_embedding(clip_model, prompts: list, device = "cpu") -> torch.Tenso
 				text = text.permute(1, 0, 2)  # (B, L, 512)
 				text = clip_model.ln_final(text)
 				return text.float()
+		
+def print_slices(block_ids, metadata_flags):
+	"""
+	Prints vertical slices of the structure to console.
+	Just for debug purposes
+	"""
+	# Convert to numpy if tensor
+	if hasattr(block_ids, 'cpu'):
+		block_ids = block_ids.cpu().numpy()
+
+	# Get dimensions
+	height, width, depth = block_ids.shape
+	print(f"\nStructure dimensions: {height}x{width}x{depth}")
+	print("=" * 50)
+
+	# Print horizontal slices (top to bottom)
+	for y in range(height):
+		print(f"\nLayer Y={y} (height {y}/{height-1}):")
+		print("-" * 30)
+
+		for x in range(width):
+			row = ""
+			for z in range(depth):
+				block_id = int(block_ids[y, x, z])
+				row += f"{block_id:4d}"
+			print(f"X={x:2d}: {row}")
+		print()
 
 # ----------------------------- Basic Blocks -------------------------------
 class ResidualBlock3D(nn.Module):
